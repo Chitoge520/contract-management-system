@@ -4,7 +4,7 @@
 
 ## 第一次使用
 
-1. **确认已安装 Python 3.10 – 3.14**
+1. **确认已安装 Python 3.10 – 3.14**（推荐 3.13；Python 3.15 太新，部分组件还不支持，可以和 3.13 同时安装，启动脚本会自动选用 3.13）
    如果没有安装，到 <https://www.python.org/downloads/> 下载，安装时勾选 **Add python.exe to PATH**。
 2. **双击 `start.bat`**
    第一次运行会自动创建独立的运行环境并安装依赖，需要联网，大约 3–5 分钟。以后每次启动只需几秒。
@@ -56,7 +56,7 @@
 这台电脑会成为大家共用的系统，同事都在浏览器里访问它。它需要保持开机，并且能上外网（第一次安装依赖、调用 AI 都要用到）。
 
 1. **安装软件**
-   - Python 3.12 或更高版本：<https://www.python.org/downloads/>，安装时勾选 **Add python.exe to PATH**。
+   - Python 3.13（3.10–3.14 均可，**不要只装 3.15**）：<https://www.python.org/downloads/>，安装时勾选 **Add python.exe to PATH**。
    - Git：<https://git-scm.com/download/win>，安装时一路默认即可。
 2. **下载代码**：在想放程序的位置（例如 `D:\`）空白处右键 → **在终端中打开**（或打开 Git Bash），运行：
    ```

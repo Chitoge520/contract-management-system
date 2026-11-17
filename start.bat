@@ -11,11 +11,19 @@ set "LOG=%~dp0start.log"
 echo ===== %date% %time% =====> "%LOG%"
 echo Folder: %cd%>> "%LOG%"
 
-rem ---- find Python ----
+rem ---- find Python: prefer a supported version even if a newer one is the default ----
 set "PY="
+rem never let the Python install manager download runtimes silently while probing
+set "PYTHON_MANAGER_AUTOMATIC_INSTALL=false"
+set "PYTHON_MANAGER_CONFIRM=false"
 where py >nul 2>nul
-if not errorlevel 1 set "PY=py -3"
+if errorlevel 1 goto trypath
+for %%V in (3.14 3.13 3.12 3.11 3.10) do if not defined PY call :trypy %%V
 if defined PY goto checkpy
+set "PY=py -3"
+goto checkpy
+
+:trypath
 where python >nul 2>nul
 if not errorlevel 1 set "PY=python"
 if defined PY goto checkpy
@@ -27,7 +35,7 @@ echo Python command: %PY%>> "%LOG%"
 %PY% --version>> "%LOG%" 2>&1
 %PY% -c "import sys; print(sys.version)"
 if errorlevel 1 goto nopython
-%PY% -c "import sys; sys.exit(0 if (3,9) <= sys.version_info[:2] <= (3,14) else 1)"
+%PY% -c "import sys; sys.exit(0 if (3,10) <= sys.version_info[:2] <= (3,14) else 1)"
 if errorlevel 1 goto badversion
 
 if exist ".venv\Scripts\python.exe" goto run
@@ -61,7 +69,9 @@ goto end
 :badversion
 echo [ERROR] Unsupported Python version.>> "%LOG%"
 echo.
-echo [ERROR] This program needs Python 3.9 - 3.14. Please install Python 3.12.
+echo [ERROR] This program needs Python 3.10 - 3.14 (Python 3.15 is too new for some components).
+echo   Please also install Python 3.13 from https://www.python.org/downloads/
+echo   You do NOT need to uninstall your current Python. Then run start.bat again.
 goto end
 
 :venvfail
@@ -81,3 +91,9 @@ goto end
 :end
 echo.
 echo You can close this window.
+goto :eof
+
+:trypy
+py -%1 -c "import sys" >nul 2>nul
+if not errorlevel 1 set "PY=py -%1"
+exit /b
