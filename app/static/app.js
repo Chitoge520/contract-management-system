@@ -5,7 +5,8 @@ const { ElMessage, ElMessageBox } = ElementPlus;
 // ---------- shared state ----------
 const store = reactive({
   lang: (() => { try { return localStorage.getItem('cms_lang') || 'zh'; } catch (e) { return 'zh'; } })(),
-  route: { name: 'list', id: null },
+  route: { name: 'list', id: null, query: {} },
+  user: null, needsSetup: false, authChecked: false,
 });
 function t(k, vars) {
   let s = (I18N[store.lang] && I18N[store.lang][k]) || I18N.zh[k] || k;
@@ -16,6 +17,11 @@ const TYPES = ['software', 'purchase', 'lease', 'service', 'other'];
 const STATUSES = ['queued', 'reading', 'extracting', 'review', 'confirmed', 'failed'];
 const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
+const ROLES = ['admin', 'editor', 'viewer'];
+const ACTIONS = ['upload', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
+  'lifecycle_status', 'notes', 'login', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
+const RANK = { viewer: 1, editor: 2, admin: 3 };
+const can = role => !!store.user && RANK[store.user.role] >= RANK[role];
 
 function fmt(n, cur) {
   if (n === null || n === undefined || n === '' || isNaN(Number(n))) return '';
@@ -27,10 +33,20 @@ function num(v) {
   const x = Number(String(v).replace(/[^0-9.\-]/g, ''));
   return isNaN(x) ? null : x;
 }
+function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function highlight(text, q) {
+  let s = esc(text);
+  (q || '').split(/\s+/).filter(Boolean).forEach(w => {
+    const re = new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    s = s.replace(re, m => '<mark>' + m + '</mark>');
+  });
+  return s;
+}
 async function api(path, opts = {}) {
   const o = Object.assign({}, opts);
   if (o.json !== undefined) { o.body = JSON.stringify(o.json); o.headers = { 'Content-Type': 'application/json' }; delete o.json; }
   const r = await fetch(path, o);
+  if (r.status === 401 && !path.startsWith('/api/auth/')) { store.user = null; throw new Error(t('loginTitle')); }
   if (!r.ok) {
     let msg = r.status + '';
     try { const j = await r.json(); msg = j.detail || JSON.stringify(j); } catch (e) {}
@@ -41,28 +57,105 @@ async function api(path, opts = {}) {
 function statusTag(s) {
   return { review: 'warning', confirmed: 'success', failed: 'danger', queued: 'info', reading: 'primary', extracting: 'primary' }[s] || 'info';
 }
-function go(name, id) { location.hash = name === 'list' ? '#/' : name === 'detail' ? '#/c/' + id : '#/' + name; }
-function parseHash() {
-  const h = location.hash.replace(/^#\/?/, '');
-  const m = h.match(/^c\/(\d+)/);
-  if (m) return { name: 'detail', id: Number(m[1]) };
-  if (h.startsWith('items')) return { name: 'items', id: null };
-  if (h.startsWith('settings')) return { name: 'settings', id: null };
-  return { name: 'list', id: null };
+function go(name, id, query) {
+  let h = name === 'list' ? '#/' : name === 'detail' ? '#/c/' + id : '#/' + name;
+  if (query) h += '?' + new URLSearchParams(query).toString();
+  location.hash = h;
 }
-const mixin = { methods: { t, fmt, statusTag }, computed: { lang() { return store.lang; } } };
+function parseHash() {
+  const raw = location.hash.replace(/^#\/?/, '');
+  const [h, qs] = raw.split('?');
+  const query = Object.fromEntries(new URLSearchParams(qs || ''));
+  const m = h.match(/^c\/(\d+)/);
+  if (m) return { name: 'detail', id: Number(m[1]), query };
+  for (const n of ['audit', 'users', 'settings']) if (h.startsWith(n)) return { name: n, id: null, query };
+  return { name: 'list', id: null, query };
+}
+function pathLabel(path) {
+  // "line_items[2].amount" -> "金额明细 #3 · 金额"
+  const parts = path.split('.');
+  const out = [];
+  parts.forEach((p, i) => {
+    const m = p.match(/^([a-z_]+)(?:\[(\d+)\])?$/i);
+    if (!m) { out.push(p); return; }
+    const key = m[1];
+    let label = i === 0 ? t('f_' + key) : FIELD_LABELS[key] ? t(FIELD_LABELS[key]) : key;
+    if (label === 'f_' + key) label = key;
+    out.push(m[2] !== undefined ? label + ' #' + (Number(m[2]) + 1) : label);
+  });
+  return out.join(' · ');
+}
+const FIELD_LABELS = { contract_no: 'contractNo', title: 'title', title_zh: 'title', party_a: 'partyA', party_b: 'partyB',
+  signing_date: 'signingDate', effective_date: 'effectiveDate', start_date: 'startDate', end_date: 'endDate', term_text: 'termText',
+  governing_law: 'governingLaw', dispute_resolution: 'dispute', currency: 'currency', settlement_currency: 'settlement',
+  total_amount: 'totalAmount', amount: 'amount', name: 'item', name_zh: 'itemZh', description: 'desc', category: 'category',
+  quantity: 'qty', unit: 'unit', unit_price: 'unitPrice', page: 'page', trigger: 'trigger', trigger_zh: 'trigger',
+  percentage: 'percent', due_rule: 'due', conditions: 'conditions', deadline_rule: 'deadlineRule', deadline_date: 'deadlineDate',
+  deliverables: 'deliverables', period: 'wPeriod', start_rule: 'wStart', content: 'wContent', rule: 'pRule', cap: 'pCap',
+  topic: 'topic', topic_zh: 'topic', section: 'section', label: 'label', label_zh: 'label', value: 'value', tax_note: 'taxNote',
+  exchange_rate_rule: 'fxRule', total_amount_text: 'totalText', party_a_address: 'addrA', party_b_address: 'addrB' };
+function showVal(v) { return v === null || v === undefined || v === '' ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v)); }
+function who(name) { return name || t('system'); }
 
-// ---------- page reference chip ----------
+const mixin = { methods: { t, fmt, statusTag, can, who }, computed: { lang() { return store.lang; } } };
+
+// ---------- small components ----------
 const PageRef = {
   mixins: [mixin], props: ['p'],
   setup() { return { openPage: inject('openPage', () => {}) }; },
   template: `<button v-if="p" class="pg" type="button" @click.stop="openPage(p)" :title="t('page') + ' ' + p">p.{{ p }}</button>`,
 };
 
-// ---------- generic table (view / edit) ----------
+const ChangeTable = {
+  mixins: [mixin], props: { changes: Array },
+  setup() { return { pathLabel, showVal }; },
+  template: `
+  <el-table :data="changes" size="small" border class="change-table">
+    <el-table-column :label="t('field')" min-width="180"><template #default="{ row }">{{ pathLabel(row.path) }}</template></el-table-column>
+    <el-table-column :label="t('oldValue')" min-width="160"><template #default="{ row }"><span class="old-val">{{ showVal(row.old) }}</span></template></el-table-column>
+    <el-table-column :label="t('newValue')" min-width="160"><template #default="{ row }"><span class="new-val">{{ showVal(row.new) }}</span></template></el-table-column>
+  </el-table>`,
+};
+
+const AuditDetail = {
+  mixins: [mixin], components: { ChangeTable }, props: { row: Object },
+  setup(props) {
+    const open = ref(false);
+    const summary = computed(() => {
+      const r = props.row, d = r.detail;
+      if (!d) return '';
+      if (r.action === 'edit') return (d.changes || []).length + ' ' + t('changes');
+      if (r.action === 'lifecycle_status') return t('l_' + (d.old || 'active')) + ' → ' + t('l_' + d.new);
+      if (r.action === 'notes') return showVal(d.new);
+      if (r.action === 'user_create') return d.username + ' (' + t('r_' + d.role) + ')';
+      if (r.action === 'user_update') return d.username + ': ' + Object.entries(d.changes || {}).map(([k, v]) =>
+        k === 'role' ? t('role') + ' ' + t('r_' + v[0]) + '→' + t('r_' + v[1]) :
+        k === 'active' ? (v[1] ? t('enabled') : t('disabled')) : k === 'password' ? t('resetPw') : k).join(', ');
+      if (r.action === 'extracted') return (d.model || '') + (d.items != null ? ' · ' + d.items + ' items' : '');
+      if (r.action === 'extract_failed') return d.error;
+      if (r.action === 'upload' || r.action === 'delete') return d.file === r.contract_label ? '' : d.file;
+      if (r.action === 'export') return d.contracts + ' contracts';
+      if (r.action === 'settings') return Object.keys(d).join(', ');
+      return '';
+    });
+    return { open, summary };
+  },
+  template: `
+  <div>
+    <span class="muted">{{ summary }}</span>
+    <template v-if="row.action === 'edit' && row.detail && (row.detail.changes || []).length">
+      <el-button link type="primary" size="small" @click="open = !open">{{ t('viewChanges') }}</el-button>
+      <div v-if="open" class="mt-s">
+        <div v-if="row.detail.reopened" class="risk small">{{ t('reopenedNote') }}</div>
+        <ChangeTable :changes="row.detail.changes" />
+      </div>
+    </template>
+  </div>`,
+};
+
 const DataTable = {
   mixins: [mixin], components: { PageRef },
-  props: { rows: Array, cols: Array, editing: Boolean, currency: String, emptyText: String },
+  props: { rows: Array, cols: Array, editing: Boolean, emptyText: String, highlightIndex: { type: Number, default: -1 } },
   emits: ['add', 'remove'],
   computed: {
     shownCols() {
@@ -70,10 +163,11 @@ const DataTable = {
       return this.cols.filter(c => !c.editOnly && (!c.optional || (this.rows || []).some(r => r[c.key] !== null && r[c.key] !== undefined && r[c.key] !== '')));
     },
   },
+  methods: { rowClass({ rowIndex }) { return rowIndex === this.highlightIndex ? 'hit-row' : ''; } },
   template: `
   <div>
-    <el-table :data="rows" border size="small" :empty-text="emptyText || '—'" style="width:100%">
-      <el-table-column v-for="c in shownCols" :key="c.key" :label="c.label" :width="c.width" :min-width="c.min"
+    <el-table :data="rows" border size="small" :empty-text="emptyText || '—'" style="width:100%" :row-class-name="rowClass">
+      <el-table-column v-for="c in shownCols" :key="c.key + (c.type||'')" :label="c.label" :width="c.width" :min-width="c.min"
         :align="c.type === 'num' ? 'right' : 'left'">
         <template #default="{ row }">
           <template v-if="editing && c.type !== 'page'">
@@ -99,41 +193,152 @@ const DataTable = {
   </div>`,
 };
 
-// ---------- list view ----------
-const ListView = {
+// ---------- login / setup ----------
+const AuthView = {
   mixins: [mixin],
   setup() {
-    const rows = ref([]); const stats = ref({ by_status: {}, totals: [], parties: [], years: [], count: 0 });
-    const loading = ref(true); const showUpload = ref(false);
-    const f = reactive({ q: '', type: '', party: '', year: '', status: '', lifecycle: '' });
-    let timer = null, debounce = null;
+    const f = reactive({ username: '', password: '', password2: '', display_name: '' });
+    const busy = ref(false);
+    async function submit() {
+      if (store.needsSetup && f.password !== f.password2) { ElMessage.error(t('pwMismatch')); return; }
+      busy.value = true;
+      try {
+        const r = store.needsSetup
+          ? await api('/api/auth/setup', { method: 'POST', json: { username: f.username, password: f.password, display_name: f.display_name } })
+          : await api('/api/auth/login', { method: 'POST', json: { username: f.username, password: f.password } });
+        store.user = r.user; store.needsSetup = false;
+      } catch (e) { ElMessage.error(e.message); }
+      busy.value = false;
+    }
+    function toggleLang() { store.lang = store.lang === 'zh' ? 'en' : 'zh'; try { localStorage.setItem('cms_lang', store.lang); } catch (e) {} }
+    return { f, busy, submit, store, toggleLang };
+  },
+  template: `
+  <div class="auth-page">
+    <div class="auth-card">
+      <div class="brand auth-brand"><div class="brand-mark" aria-hidden="true"></div>
+        <div><div class="brand-name dark">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
+      <h1>{{ store.needsSetup ? t('setupTitle') : t('loginTitle') }}</h1>
+      <p v-if="store.needsSetup" class="note">{{ t('setupText') }}</p>
+      <el-form label-position="top" @submit.prevent="submit">
+        <el-form-item :label="t('username')"><el-input v-model="f.username" autocomplete="username" autofocus /></el-form-item>
+        <el-form-item v-if="store.needsSetup" :label="t('displayName')"><el-input v-model="f.display_name" /></el-form-item>
+        <el-form-item :label="t('password')"><el-input v-model="f.password" type="password" show-password autocomplete="current-password" /></el-form-item>
+        <el-form-item v-if="store.needsSetup" :label="t('passwordAgain')"><el-input v-model="f.password2" type="password" show-password /></el-form-item>
+        <el-button type="primary" size="large" class="w100" :loading="busy" native-type="submit">{{ store.needsSetup ? t('setupBtn') : t('login') }}</el-button>
+      </el-form>
+      <button class="lang-link" type="button" @click="toggleLang">{{ t('lang') }}</button>
+    </div>
+  </div>`,
+};
+
+// ---------- search results grouped by contract ----------
+const SearchResults = {
+  mixins: [mixin], props: { rows: Array, q: String },
+  setup(props) {
+    function titleOf(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || r.file_name; }
+    function hl(s) { return highlight(s, props.q); }
+    function open(r, query) { go('detail', r.id, Object.assign({ q: props.q }, query || {})); }
+    function empty(h) { return !h || (!h.items.length && !h.terms.length && !h.page_total); }
+    return { titleOf, hl, open, empty };
+  },
+  template: `
+  <div class="results">
+    <div class="muted mb-s">{{ t('resultsFor', { n: rows.length }) }}</div>
+    <div v-for="r in rows" :key="r.id" class="result">
+      <div class="result-head" @click="open(r)">
+        <div class="result-title">
+          <span class="mono-ish" v-if="r.contract_no">{{ r.contract_no }}</span>
+          <b v-html="hl(titleOf(r))"></b>
+        </div>
+        <div class="meta-row">
+          <span v-html="hl(r.party_b || '')"></span>
+          <el-tag v-if="r.contract_type" type="info" effect="plain" size="small">{{ t('t_' + r.contract_type) }}</el-tag>
+          <el-tag :type="statusTag(r.status)" size="small">{{ t('s_' + r.status) }}</el-tag>
+          <span class="num" v-if="r.total_amount != null">{{ fmt(r.total_amount, r.currency) }}</span>
+        </div>
+      </div>
+      <div class="hit-group" v-if="r.hits.items.length">
+        <div class="hit-label">{{ t('hitItems') }} ({{ r.hits.items.length }})</div>
+        <div v-for="it in r.hits.items" :key="'i' + it.index" class="hit" @click="open(r, { tab: 'amounts', item: it.index, p: it.page || '' })">
+          <div class="hit-main"><span v-html="hl(it.name)"></span><span class="muted small" v-if="it.name_zh"> · <span v-html="hl(it.name_zh)"></span></span>
+            <div class="muted small" v-if="it.description" v-html="hl(it.description)"></div></div>
+          <span class="num hit-amt">{{ fmt(it.amount, it.currency || r.currency) }}</span>
+          <span class="pg" v-if="it.page">p.{{ it.page }}</span>
+        </div>
+      </div>
+      <div class="hit-group" v-if="r.hits.terms.length">
+        <div class="hit-label">{{ t('hitTerms') }} ({{ r.hits.terms.length }})</div>
+        <div v-for="(x, i) in r.hits.terms.slice(0, 5)" :key="'t' + i" class="hit" @click="open(r, { tab: x.tab, p: x.page || '' })">
+          <div class="hit-main"><b v-html="hl(x.kind.startsWith('summary') || x.kind.startsWith('scope') ? t('f_' + x.kind) : x.title)"></b>
+            <div class="muted small" v-html="hl(x.text)"></div></div>
+          <span class="pg" v-if="x.page">p.{{ x.page }}</span>
+        </div>
+      </div>
+      <div class="hit-group" v-if="r.hits.page_total">
+        <div class="hit-label">{{ t('hitPages') }} · {{ t('pagesMatched', { n: r.hits.page_total }) }}</div>
+        <div v-for="p in r.hits.pages" :key="'p' + p.page" class="hit" @click="open(r, { tab: 'source', p: p.page })">
+          <div class="hit-main small" v-html="hl(p.text)"></div>
+          <span class="pg">p.{{ p.page }}</span>
+        </div>
+      </div>
+      <div class="hit-group muted small" v-if="empty(r.hits)">{{ t('nameHit') }}</div>
+    </div>
+  </div>`,
+};
+
+// ---------- list view ----------
+const ListView = {
+  mixins: [mixin], components: { SearchResults },
+  setup() {
+    const rows = ref([]); const stats = ref({ by_status: {}, parties: [], years: [], count: 0 });
+    const loading = ref(true); const showUpload = ref(false); const uploader = ref(null);
+    const up = reactive({ total: 0, done: 0, created: 0 });
+    const f = reactive({ q: store.route.query.q || '', type: '', party: '', year: '', status: '', lifecycle: '' });
+    let timer = null, debounce = null, seq = 0;
     async function load() {
+      const my = ++seq;
       const p = new URLSearchParams(f).toString();
       try {
         const [r, s] = await Promise.all([api('/api/contracts?' + p), api('/api/stats')]);
+        if (my !== seq) return;
         rows.value = r; stats.value = s;
       } catch (e) { ElMessage.error(e.message); }
       loading.value = false;
       clearTimeout(timer);
-      if (r_working()) timer = setTimeout(load, 3000);
+      if (rows.value.some(r => WORKING.includes(r.status))) timer = setTimeout(load, 3000);
     }
-    function r_working() { return rows.value.some(r => WORKING.includes(r.status)); }
     watch(() => [f.type, f.party, f.year, f.status, f.lifecycle], load);
     watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(load, 300); });
     onMounted(load);
     onBeforeUnmount(() => clearTimeout(timer));
     const filtered = computed(() => !!(f.q || f.type || f.party || f.year || f.status || f.lifecycle));
-    const working = computed(() => STATUSES.filter(s => WORKING.includes(s)).reduce((a, s) => a + (stats.value.by_status[s] || 0), 0));
+    const searching = computed(() => !!f.q.trim());
+    const working = computed(() => WORKING.reduce((a, s) => a + (stats.value.by_status[s] || 0), 0));
+
+    // upload dialog: count files, close automatically when every file has finished
+    function onChange(file) { if (file.status === 'ready') up.total++; }
+    function finishOne() {
+      up.done++;
+      if (up.done >= up.total) {
+        if (up.created) ElMessage.success(t('uploaded_ok', { n: up.created }));
+        setTimeout(() => { showUpload.value = false; uploader.value && uploader.value.clearFiles(); Object.assign(up, { total: 0, done: 0, created: 0 }); }, 400);
+        load();
+      }
+    }
     function onUploaded(res) {
       (res.duplicates || []).forEach(d => ElMessage.warning(t('duplicate', { f: d.file })));
       (res.rejected || []).forEach(x => ElMessage.error(t('rejected', { f: x })));
-      if ((res.created || []).length) ElMessage.success(t('uploaded_ok', { n: res.created.length }));
-      load();
+      up.created += (res.created || []).length;
+      finishOne();
     }
-    function onUploadError(err) { ElMessage.error(String(err && err.message || err)); }
+    function onUploadError(err) { ElMessage.error(String(err && err.message || err)); finishOne(); }
+    function onDialogClosed() { uploader.value && uploader.value.clearFiles(); Object.assign(up, { total: 0, done: 0, created: 0 }); }
+
     function exportXlsx() { location.href = '/api/export.xlsx?ids=' + rows.value.map(r => r.id).join(','); }
     function titleOf(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || r.file_name; }
-    return { rows, stats, f, loading, filtered, working, showUpload, onUploaded, onUploadError, exportXlsx, titleOf, TYPES, STATUSES, LIFECYCLES, WORKING, go };
+    return { rows, stats, f, loading, filtered, searching, working, showUpload, uploader, up, onChange, onUploaded, onUploadError,
+      onDialogClosed, exportXlsx, titleOf, TYPES, STATUSES, LIFECYCLES, WORKING, go };
   },
   template: `
   <div>
@@ -141,19 +346,19 @@ const ListView = {
       <div><h1>{{ t('contracts') }}</h1><div class="sub">{{ t('contractsSub') }}</div></div>
       <div class="actions">
         <el-button @click="exportXlsx" :disabled="!rows.length"><el-icon><Download /></el-icon>{{ t('export') }}</el-button>
-        <el-button type="primary" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
+        <el-button v-if="can('editor')" type="primary" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
       </div>
     </div>
 
     <div class="ledger" v-if="stats.count">
       <div><div class="k">{{ t('total') }}</div><div class="v">{{ stats.count }}</div></div>
       <div><div class="k">{{ t('toReview') }}</div><div class="v amber">{{ stats.by_status.review || 0 }}</div></div>
+      <div><div class="k">{{ t('s_confirmed') }}</div><div class="v">{{ stats.by_status.confirmed || 0 }}</div></div>
       <div v-if="working"><div class="k">{{ t('processing') }}</div><div class="v">{{ working }}</div></div>
-      <div v-for="x in stats.totals" :key="x.currency"><div class="k">{{ t('sum') }} · {{ x.currency }}</div><div class="v">{{ fmt(x.total) }}</div></div>
     </div>
 
     <div class="filters">
-      <el-input v-model="f.q" :placeholder="t('search')" clearable class="grow"><template #prefix><el-icon><Search /></el-icon></template></el-input>
+      <el-input v-model="f.q" :placeholder="t('search')" clearable class="grow" size="large"><template #prefix><el-icon><Search /></el-icon></template></el-input>
       <el-select v-model="f.type" :placeholder="t('type')" clearable style="width:140px">
         <el-option v-for="x in TYPES" :key="x" :value="x" :label="t('t_' + x)" /></el-select>
       <el-select v-model="f.party" :placeholder="t('party')" clearable filterable style="width:220px">
@@ -166,7 +371,8 @@ const ListView = {
         <el-option v-for="x in LIFECYCLES" :key="x" :value="x" :label="t('l_' + x)" /></el-select>
     </div>
 
-    <div class="panel" v-loading="loading">
+    <SearchResults v-if="searching && rows.length" :rows="rows" :q="f.q" />
+    <div v-else class="panel" v-loading="loading">
       <el-table v-if="rows.length" :data="rows" @row-click="r => go('detail', r.id)" row-class-name="click" style="width:100%">
         <el-table-column :label="t('contractNo')" width="160">
           <template #default="{ row }"><span class="mono-ish">{{ row.contract_no || '—' }}</span></template></el-table-column>
@@ -184,22 +390,22 @@ const ListView = {
           <template #default="{ row }">{{ row.signing_date || row.effective_date || '—' }}</template></el-table-column>
         <el-table-column :label="t('status')" width="120">
           <template #default="{ row }"><el-tag :type="statusTag(row.status)" size="small">{{ t('s_' + row.status) }}</el-tag></template></el-table-column>
-        <el-table-column :label="t('lifecycle')" width="100">
-          <template #default="{ row }"><span class="muted">{{ t('l_' + (row.lifecycle_status || 'active')) }}</span></template></el-table-column>
+        <el-table-column :label="t('reviewedBy')" width="100">
+          <template #default="{ row }"><span class="muted">{{ row.confirmed_by || '' }}</span></template></el-table-column>
       </el-table>
       <el-empty v-else-if="!loading && filtered" :description="t('noMatch')" />
       <div v-else-if="!loading" class="empty-state">
         <h2>{{ t('emptyTitle') }}</h2><p>{{ t('emptyText') }}</p>
-        <el-button type="primary" size="large" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
+        <el-button v-if="can('editor')" type="primary" size="large" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
       </div>
     </div>
 
-    <el-dialog v-model="showUpload" :title="t('uploadTitle')" width="560px">
-      <el-upload drag multiple action="/api/contracts" name="files" accept=".pdf,.docx,.txt"
-        :on-success="onUploaded" :on-error="onUploadError" :show-file-list="true">
+    <el-dialog v-model="showUpload" :title="t('uploadTitle')" width="560px" @closed="onDialogClosed">
+      <el-upload ref="uploader" drag multiple action="/api/contracts" name="files" accept=".pdf,.docx,.txt"
+        :on-change="onChange" :on-success="onUploaded" :on-error="onUploadError">
         <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
         <div class="el-upload__text">{{ t('uploadHint') }}</div>
-        <template #tip><div class="el-upload__tip">{{ t('uploadTip') }}</div></template>
+        <template #tip><div class="el-upload__tip">{{ up.total && up.done < up.total ? t('uploadingN', { n: up.total - up.done }) : t('uploadTip') }}</div></template>
       </el-upload>
     </el-dialog>
   </div>`,
@@ -207,14 +413,20 @@ const ListView = {
 
 // ---------- detail view ----------
 const DetailView = {
-  mixins: [mixin], components: { PageRef, DataTable },
+  mixins: [mixin], components: { PageRef, DataTable, AuditDetail },
   props: ['id'],
   setup(props) {
-    const c = ref(null); const draft = ref(null); const editing = ref(false); const tab = ref('overview');
-    const showPdf = ref(true); const pdfPage = ref(1); const pdfKey = ref(0);
-    const pages = ref([]); const srcMode = ref('masked'); const find = ref(''); const saving = ref(false);
+    const query = store.route.query || {};
+    const c = ref(null); const draft = ref(null); const editing = ref(false);
+    const tab = ref(['overview', 'amounts', 'payments', 'terms', 'source', 'history'].includes(query.tab) ? query.tab : 'overview');
+    const showPdf = ref((() => { try { return localStorage.getItem('cms_pdf') !== '0'; } catch (e) { return true; } })());
+    const pdfPage = ref(Number(query.p) || 1); const pdfKey = ref(0);
+    const hitItem = ref(query.item !== undefined && query.item !== '' ? Number(query.item) : -1);
+    const pages = ref([]); const srcMode = ref('masked'); const find = ref(query.tab === 'source' ? (query.q || '') : ''); const saving = ref(false);
+    const historyRows = ref([]);
     let timer = null;
     const pdfRef = ref(null);
+    watch(showPdf, v => { try { localStorage.setItem('cms_pdf', v ? '1' : '0'); } catch (e) {} });
     function openPage(p) {
       showPdf.value = true; pdfPage.value = p; pdfKey.value++;
       if (window.innerWidth < 1100) nextTick(() => pdfRef.value && pdfRef.value.scrollIntoView({ behavior: 'smooth' }));
@@ -226,8 +438,12 @@ const DetailView = {
       if (WORKING.includes(c.value.status)) timer = setTimeout(load, 3000);
     }
     async function loadPages() { pages.value = await api('/api/contracts/' + props.id + '/pages'); }
-    watch(tab, v => { if (v === 'source' && !pages.value.length) loadPages(); });
-    onMounted(load);
+    async function loadHistory() { historyRows.value = await api('/api/contracts/' + props.id + '/history'); }
+    watch(tab, v => { if (v === 'source' && !pages.value.length) loadPages(); if (v === 'history') loadHistory(); }, { immediate: true });
+    onMounted(async () => {
+      await load();
+      if (hitItem.value >= 0) setTimeout(() => { const el = document.querySelector('.hit-row'); el && el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }, 300);
+    });
     onBeforeUnmount(() => clearTimeout(timer));
 
     const d = computed(() => (editing.value ? draft.value : c.value && c.value.data) || null);
@@ -264,6 +480,7 @@ const DetailView = {
       try {
         c.value = await api('/api/contracts/' + props.id, { method: 'PUT', json: { data: draft.value } });
         editing.value = false; draft.value = null; ElMessage.success(t('saved'));
+        if (tab.value === 'history') loadHistory();
       } catch (e) { ElMessage.error(e.message); }
       saving.value = false;
     }
@@ -273,7 +490,8 @@ const DetailView = {
     }
     async function confirmReview() {
       if (editing.value) await save();
-      c.value = await api('/api/contracts/' + props.id + '/confirm', { method: 'POST' }); ElMessage.success(t('confirmed'));
+      try { c.value = await api('/api/contracts/' + props.id + '/confirm', { method: 'POST' }); ElMessage.success(t('confirmed')); }
+      catch (e) { ElMessage.error(e.message); }
     }
     async function unconfirm() { c.value = await api('/api/contracts/' + props.id + '/unconfirm', { method: 'POST' }); }
     async function onMore(cmd) {
@@ -348,7 +566,7 @@ const DetailView = {
       ['total_amount_text', 'totalText'], ['tax_note', 'taxNote'], ['exchange_rate_rule', 'fxRule']];
 
     function hl(text) {
-      let s = (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+      let s = esc(text);
       s = s.replace(/\[REDACTED\]/g, '<span class="redacted">[REDACTED]</span>');
       const q = find.value.trim();
       if (q) {
@@ -364,13 +582,13 @@ const DetailView = {
 
     return { c, d, draft, editing, tab, showPdf, pdfPage, pdfKey, pdfRef, pages, srcMode, find, saving, isPdf, cur, title, subTitle, recon,
       startEdit, cancelEdit, save, setMeta, confirmReview, unconfirm, onMore, addRow, removeRow, cols, basicFields, amountFields,
-      hl, shownPages, openPage, go, TYPES, LIFECYCLES, WORKING, store };
+      hl, shownPages, openPage, go, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows };
   },
   template: `
   <div v-if="c">
     <div class="ph detail-head">
       <div class="head-left">
-        <el-button link @click="go('list')"><el-icon><ArrowLeft /></el-icon>{{ t('back') }}</el-button>
+        <el-button link @click="go('list', null, store.route.query.q ? { q: store.route.query.q } : null)"><el-icon><ArrowLeft /></el-icon>{{ t('back') }}</el-button>
         <h1>{{ title }}</h1>
         <div class="sub" v-if="subTitle">{{ subTitle }}</div>
         <div class="meta-row">
@@ -378,14 +596,20 @@ const DetailView = {
           <el-tag v-if="c.contract_type" type="info" effect="plain" size="small">{{ t('t_' + c.contract_type) }}</el-tag>
           <el-tag :type="statusTag(c.status)" size="small">{{ t('s_' + c.status) }}</el-tag>
           <span v-if="c.page_count">{{ c.page_count }} {{ t('pages') }}<template v-if="c.ocr_pages"> · {{ c.ocr_pages }} {{ t('ocrPages') }}</template></span>
-          <span class="muted">{{ c.file_name }}</span>
+        </div>
+        <div class="meta-row people">
+          <span v-if="c.uploaded_by">{{ t('uploadedBy') }}：{{ c.uploaded_by }} <span class="muted">{{ (c.uploaded_at || '').slice(0, 16) }}</span></span>
+          <span v-if="c.updated_by">{{ t('updatedBy') }}：{{ c.updated_by }}</span>
+          <span v-if="c.confirmed_by" class="ok">{{ t('reviewedBy') }}：{{ c.confirmed_by }} <span class="muted">{{ (c.confirmed_at || '').slice(0, 16) }}</span></span>
         </div>
       </div>
       <div class="actions">
-        <el-select :model-value="c.lifecycle_status || 'active'" @change="v => setMeta('lifecycle_status', v)" style="width:120px">
+        <el-button @click="showPdf = !showPdf" :type="showPdf ? '' : 'primary'" plain>
+          <el-icon><Document /></el-icon>{{ showPdf ? t('hidePdf') : t('showPdf') }}</el-button>
+        <el-select :model-value="c.lifecycle_status || 'active'" @change="v => setMeta('lifecycle_status', v)" style="width:120px" :disabled="!can('editor')">
           <el-option v-for="x in LIFECYCLES" :key="x" :value="x" :label="t('l_' + x)" />
         </el-select>
-        <template v-if="c.data">
+        <template v-if="c.data && can('editor')">
           <template v-if="editing">
             <el-button @click="cancelEdit">{{ t('cancel') }}</el-button>
             <el-button type="primary" :loading="saving" @click="save">{{ t('save') }}</el-button>
@@ -397,10 +621,10 @@ const DetailView = {
         <el-dropdown trigger="click" @command="onMore">
           <el-button><el-icon><MoreFilled /></el-icon></el-button>
           <template #dropdown><el-dropdown-menu>
-            <el-dropdown-item command="extract" :disabled="WORKING.includes(c.status)">{{ t('reextract') }}</el-dropdown-item>
-            <el-dropdown-item command="read" :disabled="WORKING.includes(c.status)">{{ t('reread') }}</el-dropdown-item>
+            <el-dropdown-item v-if="can('editor')" command="extract" :disabled="WORKING.includes(c.status)">{{ t('reextract') }}</el-dropdown-item>
+            <el-dropdown-item v-if="can('editor')" command="read" :disabled="WORKING.includes(c.status)">{{ t('reread') }}</el-dropdown-item>
             <el-dropdown-item command="download">{{ t('download') }}</el-dropdown-item>
-            <el-dropdown-item command="delete" divided><span class="danger">{{ t('del') }}</span></el-dropdown-item>
+            <el-dropdown-item v-if="can('admin')" command="delete" divided><span class="danger">{{ t('del') }}</span></el-dropdown-item>
           </el-dropdown-menu></template>
         </el-dropdown>
       </div>
@@ -409,12 +633,11 @@ const DetailView = {
     <el-alert v-if="WORKING.includes(c.status)" type="info" :closable="false" show-icon class="mb"
       :title="t('processingNow') + '：' + t('s_' + c.status) + (c.progress ? ' — ' + c.progress : '')" />
     <el-alert v-if="c.status === 'failed'" type="error" :closable="false" show-icon class="mb" :title="t('failedTitle')" :description="c.error" />
-    <el-alert v-if="c.status === 'review' && !editing" type="warning" :closable="false" show-icon class="mb" :title="t('reviewTip')" />
+    <el-alert v-if="c.status === 'review' && !editing && can('editor')" type="warning" :closable="false" show-icon class="mb" :title="t('reviewTip')" />
 
     <div class="detail" :class="{ nopdf: !showPdf }">
       <div class="detail-main">
         <el-tabs v-model="tab">
-          <!-- overview -->
           <el-tab-pane :label="t('tabOverview')" name="overview">
             <template v-if="d">
               <div class="card">
@@ -457,12 +680,11 @@ const DetailView = {
               <div class="card">
                 <h2>{{ t('notes') }}</h2>
                 <el-input :model-value="c.notes" @change="v => setMeta('notes', v)" @update:model-value="v => c.notes = v"
-                  type="textarea" :autosize="{minRows:2}" :placeholder="t('notesPh')" />
+                  type="textarea" :autosize="{minRows:2}" :placeholder="t('notesPh')" :disabled="!can('editor')" />
               </div>
             </template>
           </el-tab-pane>
 
-          <!-- amounts -->
           <el-tab-pane :label="t('tabAmounts')" name="amounts">
             <template v-if="d">
               <div v-if="recon" class="recon" :class="recon.ok ? 'match' : 'mismatch'">
@@ -482,13 +704,12 @@ const DetailView = {
               </div>
               <div class="card">
                 <h2>{{ t('lineItems') }}</h2>
-                <DataTable :rows="d.line_items" :cols="cols.items" :editing="editing"
+                <DataTable :rows="d.line_items" :cols="cols.items" :editing="editing" :highlight-index="hitItem"
                   @add="addRow('line_items', { currency: cur })" @remove="i => removeRow('line_items', i)" />
               </div>
             </template>
           </el-tab-pane>
 
-          <!-- payments -->
           <el-tab-pane :label="t('tabPayments')" name="payments">
             <template v-if="d">
               <div class="card"><h2>{{ t('payments') }} <span class="muted" v-if="cur">{{ cur }}</span></h2>
@@ -500,7 +721,6 @@ const DetailView = {
             </template>
           </el-tab-pane>
 
-          <!-- terms -->
           <el-tab-pane :label="t('tabTerms')" name="terms">
             <template v-if="d">
               <div class="card"><h2>{{ t('warranty') }} <PageRef :p="d.warranty && d.warranty.page" /></h2>
@@ -522,7 +742,6 @@ const DetailView = {
             </template>
           </el-tab-pane>
 
-          <!-- source -->
           <el-tab-pane :label="t('tabSource')" name="source">
             <el-alert type="success" :closable="false" show-icon class="mb" :title="t('maskedNote', { n: c.redaction_count || 0 })" />
             <div class="filters">
@@ -537,79 +756,135 @@ const DetailView = {
               <div class="page-text" v-html="hl(srcMode === 'masked' ? p.redacted_text : p.text)"></div>
             </div>
           </el-tab-pane>
+
+          <el-tab-pane :label="t('tabHistory')" name="history">
+            <el-empty v-if="!historyRows.length" :description="t('noHistory')" />
+            <el-timeline v-else class="history">
+              <el-timeline-item v-for="h in historyRows" :key="h.id" :timestamp="h.ts" placement="top"
+                :type="h.action === 'confirm' ? 'success' : h.action === 'edit' ? 'warning' : h.action === 'extract_failed' ? 'danger' : 'primary'">
+                <div class="hist-line"><b>{{ who(h.username) }}</b> {{ t('a_' + h.action) }}</div>
+                <AuditDetail :row="h" />
+              </el-timeline-item>
+            </el-timeline>
+          </el-tab-pane>
         </el-tabs>
       </div>
 
       <div class="pdf" v-show="showPdf" ref="pdfRef">
-        <div class="pdf-bar"><span>{{ t('pdfTitle') }}</span>
-          <el-button link size="small" @click="showPdf = false">{{ t('hidePdf') }}</el-button></div>
+        <div class="pdf-bar"><span>{{ t('pdfTitle') }} · p.{{ pdfPage }}</span>
+          <el-button link size="small" @click="showPdf = false"><el-icon><Close /></el-icon></el-button></div>
         <iframe v-if="isPdf" :key="pdfKey" :src="'/api/contracts/' + c.id + '/file#page=' + pdfPage + '&view=FitH'" title="PDF"></iframe>
         <el-empty v-else :description="t('noPreview')" />
       </div>
     </div>
-    <el-button v-if="!showPdf" class="pdf-fab" type="primary" @click="showPdf = true"><el-icon><Document /></el-icon>{{ t('showPdf') }}</el-button>
   </div>`,
 };
 
-// ---------- line items view ----------
-const ItemsView = {
-  mixins: [mixin], components: { PageRef },
+// ---------- audit view ----------
+const AuditView = {
+  mixins: [mixin], components: { AuditDetail },
   setup() {
-    const rows = ref([]); const parties = ref([]); const loading = ref(true);
-    const f = reactive({ q: '', type: '', party: '', confirmed_only: 0 });
-    let debounce = null;
+    const rows = ref([]); const total = ref(0); const loading = ref(true); const page = ref(1); const size = 50;
+    const f = reactive({ user_q: '', action: '', range: null });
     async function load() {
       loading.value = true;
-      try { rows.value = await api('/api/items?' + new URLSearchParams(f).toString()); } catch (e) { ElMessage.error(e.message); }
+      const p = { user_q: f.user_q, action: f.action, limit: size, offset: (page.value - 1) * size };
+      if (f.range && f.range.length === 2) { p.date_from = f.range[0]; p.date_to = f.range[1]; }
+      try { const r = await api('/api/audit?' + new URLSearchParams(p).toString()); rows.value = r.rows; total.value = r.total; }
+      catch (e) { ElMessage.error(e.message); }
       loading.value = false;
     }
-    watch(() => [f.type, f.party, f.confirmed_only], load);
-    watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(load, 300); });
-    onMounted(async () => { load(); parties.value = (await api('/api/stats')).parties; });
-    const totals = computed(() => {
-      const m = {};
-      rows.value.forEach(r => { if (r.amount != null) { const k = r.currency || '?'; m[k] = (m[k] || 0) + r.amount; } });
-      return Object.entries(m);
-    });
-    function summary() { return ['', t('sumBy'), '', '', totals.value.map(([k, v]) => fmt(v, k)).join(' / '), '']; }
-    function exportXlsx() {
-      const ids = [...new Set(rows.value.map(r => r.contract_id))];
-      location.href = '/api/export.xlsx?ids=' + ids.join(',');
-    }
-    function cTitle(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || ''; }
-    return { rows, f, parties, loading, totals, summary, exportXlsx, cTitle, TYPES, go, store };
+    let debounce = null;
+    watch(() => [f.action, f.range], () => { page.value = 1; load(); });
+    watch(() => f.user_q, () => { clearTimeout(debounce); debounce = setTimeout(() => { page.value = 1; load(); }, 300); });
+    watch(page, load);
+    onMounted(load);
+    return { rows, total, loading, page, size, f, ACTIONS, go };
   },
   template: `
   <div>
-    <div class="ph">
-      <div><h1>{{ t('itemsTitle') }}</h1><div class="sub">{{ t('itemsSub') }}</div></div>
-      <div class="actions"><el-button @click="exportXlsx" :disabled="!rows.length"><el-icon><Download /></el-icon>{{ t('export') }}</el-button></div>
-    </div>
+    <div class="ph"><div><h1>{{ t('auditTitle') }}</h1><div class="sub">{{ t('auditSub') }}</div></div></div>
     <div class="filters">
-      <el-input v-model="f.q" :placeholder="t('itemsSearch')" clearable class="grow"><template #prefix><el-icon><Search /></el-icon></template></el-input>
-      <el-select v-model="f.type" :placeholder="t('type')" clearable style="width:140px"><el-option v-for="x in TYPES" :key="x" :value="x" :label="t('t_' + x)" /></el-select>
-      <el-select v-model="f.party" :placeholder="t('party')" clearable filterable style="width:220px"><el-option v-for="x in parties" :key="x" :value="x" :label="x" /></el-select>
-      <el-checkbox v-model="f.confirmed_only" :true-value="1" :false-value="0" border>{{ t('onlyConfirmed') }}</el-checkbox>
-    </div>
-    <div class="ledger" v-if="totals.length">
-      <div><div class="k">{{ t('lineItems') }}</div><div class="v">{{ rows.length }}</div></div>
-      <div v-for="[k, v] in totals" :key="k"><div class="k">{{ t('sumBy') }} · {{ k }}</div><div class="v">{{ fmt(v) }}</div></div>
+      <el-input v-model="f.user_q" :placeholder="t('user')" clearable style="width:180px"><template #prefix><el-icon><User /></el-icon></template></el-input>
+      <el-select v-model="f.action" :placeholder="t('allActions')" clearable style="width:180px">
+        <el-option v-for="a in ACTIONS" :key="a" :value="a" :label="t('a_' + a)" /></el-select>
+      <el-date-picker v-model="f.range" type="daterange" value-format="YYYY-MM-DD" :start-placeholder="t('dateRange')" :end-placeholder="t('dateRange')" style="width:280px" />
     </div>
     <div class="panel" v-loading="loading">
-      <el-table :data="rows" style="width:100%" :empty-text="t('noMatch')">
-        <el-table-column :label="t('contract')" min-width="220">
-          <template #default="{ row }"><a href="javascript:void 0" @click="go('detail', row.contract_id)">{{ row.contract_no || cTitle(row) }}</a>
-            <div class="muted small">{{ row.party_b }}</div></template></el-table-column>
-        <el-table-column :label="t('category')" prop="category" min-width="160" show-overflow-tooltip />
-        <el-table-column :label="t('item')" min-width="220">
-          <template #default="{ row }"><div>{{ row.name }}</div><div class="muted small" v-if="row.name_zh">{{ row.name_zh }}</div></template></el-table-column>
-        <el-table-column :label="t('desc')" prop="description" min-width="280" show-overflow-tooltip />
-        <el-table-column :label="t('amount')" width="170" align="right">
-          <template #default="{ row }"><span class="num">{{ fmt(row.amount, row.currency) }}</span></template></el-table-column>
-        <el-table-column :label="t('page')" width="70">
-          <template #default="{ row }"><a href="javascript:void 0" class="pg" @click="go('detail', row.contract_id)" v-if="row.page">p.{{ row.page }}</a></template></el-table-column>
+      <el-table :data="rows" style="width:100%" :empty-text="t('noHistory')">
+        <el-table-column :label="t('time')" width="190"><template #default="{ row }"><span class="num">{{ row.ts }}</span></template></el-table-column>
+        <el-table-column :label="t('user')" width="120"><template #default="{ row }">{{ who(row.username) }}</template></el-table-column>
+        <el-table-column :label="t('action')" width="150"><template #default="{ row }">
+          <el-tag size="small" :type="row.action === 'confirm' ? 'success' : row.action === 'edit' ? 'warning' : ['delete','extract_failed'].includes(row.action) ? 'danger' : 'info'" effect="plain">{{ t('a_' + row.action) }}</el-tag></template></el-table-column>
+        <el-table-column :label="t('target')" min-width="200"><template #default="{ row }">
+          <a v-if="row.contract_id && row.action !== 'delete'" href="javascript:void 0" @click="go('detail', row.contract_id, { tab: 'history' })">{{ row.contract_label || ('#' + row.contract_id) }}</a>
+          <span v-else class="muted">{{ row.contract_label }}</span></template></el-table-column>
+        <el-table-column :label="t('details')" min-width="320"><template #default="{ row }"><AuditDetail :row="row" /></template></el-table-column>
       </el-table>
     </div>
+    <el-pagination v-if="total > size" class="pager" layout="prev, pager, next, total" :total="total" :page-size="size" v-model:current-page="page" />
+  </div>`,
+};
+
+// ---------- users view ----------
+const UsersView = {
+  mixins: [mixin],
+  setup() {
+    const rows = ref([]); const loading = ref(true); const dlg = ref(false); const busy = ref(false);
+    const form = reactive({ id: null, username: '', display_name: '', role: 'editor', active: true, password: '' });
+    async function load() { loading.value = true; try { rows.value = await api('/api/users'); } catch (e) { ElMessage.error(e.message); } loading.value = false; }
+    onMounted(load);
+    function openNew() { Object.assign(form, { id: null, username: '', display_name: '', role: 'editor', active: true, password: '' }); dlg.value = true; }
+    function openEdit(u) { Object.assign(form, { id: u.id, username: u.username, display_name: u.display_name, role: u.role, active: !!u.active, password: '' }); dlg.value = true; }
+    async function submit() {
+      busy.value = true;
+      try {
+        if (form.id) {
+          const body = { display_name: form.display_name, role: form.role, active: form.active };
+          if (form.password) body.password = form.password;
+          await api('/api/users/' + form.id, { method: 'PUT', json: body });
+        } else {
+          await api('/api/users', { method: 'POST', json: { username: form.username, display_name: form.display_name, role: form.role, password: form.password } });
+        }
+        dlg.value = false; ElMessage.success(t('saved')); load();
+      } catch (e) { ElMessage.error(e.message); }
+      busy.value = false;
+    }
+    return { rows, loading, dlg, busy, form, openNew, openEdit, submit, ROLES, store };
+  },
+  template: `
+  <div class="users">
+    <div class="ph"><div><h1>{{ t('navUsers') }}</h1><div class="sub">{{ t('usersSub') }}</div></div>
+      <div class="actions"><el-button type="primary" @click="openNew"><el-icon><Plus /></el-icon>{{ t('addUser') }}</el-button></div></div>
+    <div class="role-help">
+      <div v-for="r in ROLES" :key="r"><el-tag size="small" :type="r === 'admin' ? 'danger' : r === 'editor' ? 'warning' : 'info'">{{ t('r_' + r) }}</el-tag> <span class="muted small">{{ t('r_' + r + '_d') }}</span></div>
+    </div>
+    <div class="panel" v-loading="loading">
+      <el-table :data="rows" style="width:100%">
+        <el-table-column :label="t('username')" prop="username" width="160" />
+        <el-table-column :label="t('displayName')" prop="display_name" min-width="140" />
+        <el-table-column :label="t('role')" width="120"><template #default="{ row }">
+          <el-tag size="small" :type="row.role === 'admin' ? 'danger' : row.role === 'editor' ? 'warning' : 'info'">{{ t('r_' + row.role) }}</el-tag></template></el-table-column>
+        <el-table-column :label="t('active')" width="100"><template #default="{ row }">
+          <span :class="row.active ? 'ok' : 'muted'">{{ row.active ? t('enabled') : t('disabled') }}</span></template></el-table-column>
+        <el-table-column :label="t('lastLogin')" width="190"><template #default="{ row }"><span class="num muted">{{ row.last_login || '—' }}</span></template></el-table-column>
+        <el-table-column width="90" align="right"><template #default="{ row }">
+          <el-button link type="primary" @click="openEdit(row)">{{ t('edit') }}</el-button></template></el-table-column>
+      </el-table>
+    </div>
+    <el-dialog v-model="dlg" :title="form.id ? t('editUser') : t('addUser')" width="460px">
+      <el-form label-width="96px" label-position="left" @submit.prevent="submit">
+        <el-form-item :label="t('username')"><el-input v-model="form.username" :disabled="!!form.id" /></el-form-item>
+        <el-form-item :label="t('displayName')"><el-input v-model="form.display_name" /></el-form-item>
+        <el-form-item :label="t('role')">
+          <el-radio-group v-model="form.role"><el-radio-button v-for="r in ROLES" :key="r" :value="r">{{ t('r_' + r) }}</el-radio-button></el-radio-group>
+          <div class="muted small w100">{{ t('r_' + form.role + '_d') }}</div></el-form-item>
+        <el-form-item v-if="form.id" :label="t('active')"><el-switch v-model="form.active" :disabled="form.id === store.user.id" /></el-form-item>
+        <el-form-item :label="form.id ? t('resetPw') : t('password')">
+          <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? t('resetPwPh') : ''" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="dlg = false">{{ t('cancel') }}</el-button><el-button type="primary" :loading="busy" @click="submit">{{ t('save') }}</el-button></template>
+    </el-dialog>
   </div>`,
 };
 
@@ -674,39 +949,86 @@ const SettingsView = {
 // ---------- root ----------
 const Root = {
   mixins: [mixin],
-  components: { ListView, DetailView, ItemsView, SettingsView },
+  components: { AuthView, ListView, DetailView, AuditView, UsersView, SettingsView },
   setup() {
     const epLocale = computed(() => store.lang === 'zh' ? ElementPlusLocaleZhCn : ElementPlusLocaleEn);
     function sync() { store.route = parseHash(); window.scrollTo(0, 0); }
     window.addEventListener('hashchange', sync); sync();
+    async function checkAuth() {
+      try { const s = await api('/api/auth/state'); store.user = s.user; store.needsSetup = s.needs_setup; }
+      catch (e) { store.user = null; }
+      store.authChecked = true;
+    }
+    onMounted(checkAuth);
     function toggleLang() {
       store.lang = store.lang === 'zh' ? 'en' : 'zh';
       try { localStorage.setItem('cms_lang', store.lang); } catch (e) {}
       document.documentElement.lang = store.lang === 'zh' ? 'zh-CN' : 'en';
     }
+    async function logout() { await api('/api/auth/logout', { method: 'POST' }); store.user = null; go('list'); }
+    const pwDlg = ref(false); const pw = reactive({ old_password: '', new_password: '', again: '' });
+    async function changePw() {
+      if (pw.new_password !== pw.again) { ElMessage.error(t('pwMismatch')); return; }
+      try { await api('/api/auth/password', { method: 'POST', json: pw }); pwDlg.value = false; ElMessage.success(t('pwChanged')); Object.assign(pw, { old_password: '', new_password: '', again: '' }); }
+      catch (e) { ElMessage.error(e.message); }
+    }
+    function onUserCmd(cmd) { if (cmd === 'logout') logout(); if (cmd === 'pw') pwDlg.value = true; if (cmd === 'lang') toggleLang(); }
     const active = computed(() => store.route.name === 'detail' ? 'list' : store.route.name);
-    return { store, epLocale, toggleLang, active, go };
+    const allowed = computed(() => {
+      const n = store.route.name;
+      return !((n === 'users' || n === 'settings') && !can('admin'));
+    });
+    return { store, epLocale, toggleLang, active, go, onUserCmd, pwDlg, pw, changePw, allowed };
   },
   template: `
   <el-config-provider :locale="epLocale">
-    <div class="shell">
-      <aside class="nav">
-        <div class="brand"><div class="brand-mark" aria-hidden="true"></div>
-          <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
-        <el-menu :default-active="active" @select="k => go(k)" background-color="transparent" text-color="#C9D3DD" active-text-color="#ffffff" class="nav-menu">
-          <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
-          <el-menu-item index="items"><el-icon><List /></el-icon><span>{{ t('navItems') }}</span></el-menu-item>
-          <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>{{ t('navSettings') }}</span></el-menu-item>
-        </el-menu>
-        <div class="nav-foot"><button class="lang" type="button" @click="toggleLang">{{ t('lang') }}</button></div>
-      </aside>
-      <main class="main">
-        <ListView v-if="store.route.name === 'list'" :key="'l' + store.lang" />
-        <DetailView v-else-if="store.route.name === 'detail'" :id="store.route.id" :key="'d' + store.route.id" />
-        <ItemsView v-else-if="store.route.name === 'items'" />
-        <SettingsView v-else-if="store.route.name === 'settings'" />
-      </main>
-    </div>
+    <template v-if="store.authChecked">
+      <AuthView v-if="!store.user" />
+      <div v-else class="shell">
+        <aside class="nav">
+          <div class="brand"><div class="brand-mark" aria-hidden="true"></div>
+            <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
+          <el-menu :default-active="active" @select="k => go(k)" background-color="transparent" text-color="#C9D3DD" active-text-color="#ffffff" class="nav-menu">
+            <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
+            <el-menu-item index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
+            <el-menu-item v-if="can('admin')" index="users"><el-icon><User /></el-icon><span>{{ t('navUsers') }}</span></el-menu-item>
+            <el-menu-item v-if="can('admin')" index="settings"><el-icon><Setting /></el-icon><span>{{ t('navSettings') }}</span></el-menu-item>
+          </el-menu>
+          <div class="nav-foot">
+            <el-dropdown trigger="click" @command="onUserCmd" placement="top-start" class="w100">
+              <button class="me" type="button">
+                <span class="avatar">{{ (store.user.display_name || store.user.username).slice(0, 1).toUpperCase() }}</span>
+                <span class="me-text"><span class="me-name">{{ store.user.display_name || store.user.username }}</span>
+                  <span class="me-role">{{ t('r_' + store.user.role) }}</span></span>
+              </button>
+              <template #dropdown><el-dropdown-menu>
+                <el-dropdown-item command="lang">{{ t('lang') }}</el-dropdown-item>
+                <el-dropdown-item command="pw">{{ t('changePw') }}</el-dropdown-item>
+                <el-dropdown-item command="logout" divided>{{ t('logout') }}</el-dropdown-item>
+              </el-dropdown-menu></template>
+            </el-dropdown>
+          </div>
+        </aside>
+        <main class="main">
+          <template v-if="allowed">
+            <ListView v-if="store.route.name === 'list'" :key="'l' + (store.route.query.q || '')" />
+            <DetailView v-else-if="store.route.name === 'detail'" :id="store.route.id" :key="'d' + store.route.id + JSON.stringify(store.route.query)" />
+            <AuditView v-else-if="store.route.name === 'audit'" />
+            <UsersView v-else-if="store.route.name === 'users'" />
+            <SettingsView v-else-if="store.route.name === 'settings'" />
+          </template>
+          <el-result v-else icon="warning" :title="'403'" />
+        </main>
+        <el-dialog v-model="pwDlg" :title="t('changePw')" width="420px">
+          <el-form label-position="top">
+            <el-form-item :label="t('oldPw')"><el-input v-model="pw.old_password" type="password" show-password /></el-form-item>
+            <el-form-item :label="t('newPw')"><el-input v-model="pw.new_password" type="password" show-password /></el-form-item>
+            <el-form-item :label="t('passwordAgain')"><el-input v-model="pw.again" type="password" show-password @keyup.enter="changePw" /></el-form-item>
+          </el-form>
+          <template #footer><el-button @click="pwDlg = false">{{ t('cancel') }}</el-button><el-button type="primary" @click="changePw">{{ t('save') }}</el-button></template>
+        </el-dialog>
+      </div>
+    </template>
   </el-config-provider>`,
 };
 

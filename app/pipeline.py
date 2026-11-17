@@ -39,6 +39,8 @@ def _process(cid, stage):
     data, model = extract_contract([(p["page_no"], p["redacted_text"]) for p in pages])
     db.save_data(cid, data, model)
     db.set_status(cid, "review", None)
+    from . import auth
+    auth.log(None, "extracted", cid, {"model": model, "items": len(data.get("line_items") or [])})
 
 
 def _worker():
@@ -49,6 +51,11 @@ def _worker():
         except Exception as e:  # keep worker alive
             traceback.print_exc()
             db.set_status(cid, "failed", None, str(e)[:1000])
+            try:
+                from . import auth
+                auth.log(None, "extract_failed", cid, {"error": str(e)[:300]})
+            except Exception:
+                pass
         finally:
             _q.task_done()
 
