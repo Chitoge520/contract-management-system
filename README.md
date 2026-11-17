@@ -51,7 +51,52 @@
 
 **金额明细** 页面顶部会自动核对“各项明细之和”是否等于“合同总额”，对不上会标红提示。
 
-## 部署到另一台内网电脑（作为正式服务器）
+## 部署到云服务器（Ubuntu 24.04，推荐）
+
+部署后，大家在任何地方都可以通过 `https://你的域名` 访问。系统作为后台服务运行，开机自动启动，出问题会自动重启。
+
+**准备工作**
+1. 云服务器重装为 **Ubuntu 24.04 LTS**，内存至少 2 GB。
+2. 在域名服务商处添加一条 **A 记录**，例如 `contracts.你的域名.com`，指向服务器的公网 IP。
+3. 在云厂商控制台的**安全组 / 防火墙**里放行 **22、80、443** 端口。
+4. 在 GitHub 生成一个只读令牌，用来下载私有仓库：
+   - 路径：GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token。
+   - Repository access 选 **Only select repositories → contract-management-system**。
+   - Permissions → Repository permissions → **Contents: Read-only**。
+
+**安装（SSH 登录服务器后，以 root 执行）**
+```bash
+git clone https://github.com/Chitoge520/contract-management-system.git /opt/contract-register
+#   Username: Chitoge520    Password: 粘贴上面生成的令牌
+git -C /opt/contract-register config credential.helper store   # 记住令牌，以后更新不用再输
+bash /opt/contract-register/deploy/install.sh contracts.你的域名.com 你的邮箱
+bash /opt/contract-register/deploy/backup.sh --install          # 每天 02:30 自动备份，保留 14 天
+```
+脚本依次完成：
+- 安装依赖
+- 创建专用运行账号
+- 注册系统服务
+- 配置 Nginx
+- 开启防火墙
+- 申请 HTTPS 证书（免费，自动续期）
+
+完成后打开 `https://你的域名`，创建管理员账号，在 **设置** 里填写 API Key。
+
+**日常维护**
+| 做什么 | 命令 |
+|---|---|
+| 更新到最新版本 | `bash /opt/contract-register/deploy/update.sh` |
+| 查看运行状态 | `systemctl status contract-register` |
+| 查看日志 | `journalctl -u contract-register -f` |
+| 重启 | `systemctl restart contract-register` |
+| 手动备份 | `bash /opt/contract-register/deploy/backup.sh`（备份在 `/var/backups/contract-register`） |
+
+**安全措施**
+- 只开放 22 / 80 / 443 端口；全站强制 HTTPS，登录 Cookie 只通过加密连接传输。
+- 同一 IP 连续输错密码 8 次，锁定 15 分钟。所有登录和失败尝试都记录在审计日志里，包含 IP。
+- 程序用一个没有登录权限的专用账号运行，只能写自己的 `data` 目录。
+
+## 部署到另一台内网电脑（Windows）
 
 这台电脑会成为大家共用的系统，同事都在浏览器里访问它。它需要保持开机，并且能上外网（第一次安装依赖、调用 AI 都要用到）。
 

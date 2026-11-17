@@ -49,8 +49,40 @@ def _name(user):
 
 
 # ================= auth =================
-def _set_cookie(resp: Response, token: str):
-    resp.set_cookie(auth.SESSION_COOKIE, token, max_age=auth.SESSION_DAYS * 86400, httponly=True, samesite="lax")
+def _set_cookie(request: Request, resp: Response, token: str):
+    # behind Nginx/HTTPS the cookie is only ever sent over encrypted connections
+    secure = request.url.scheme == "https"
+    resp.set_cookie(auth.SESSION_COOKIE, token, max_age=auth.SESSION_DAYS * 86400, httponly=True, samesite="lax", secure=secure)
+
+
+# ---- brute-force protection: too many wrong passwords -> short lockout ----
+_FAILS = {}
+MAX_FAILS, WINDOW_SEC, LOCK_SEC = 8, 15 * 60, 15 * 60
+
+
+def _client_ip(request: Request):
+    return request.client.host if request.client else "?"
+
+
+def _check_locked(*keys):
+    import time
+    now = time.time()
+    for k in keys:
+        rec = _FAILS.get(k)
+        if rec and rec.get("locked_until", 0) > now:
+            mins = int((rec["locked_until"] - now) // 60) + 1
+            raise HTTPException(429, f"尝试次数过多，请 {mins} 分钟后再试 / Too many attempts, try again in {mins} min")
+
+
+def _record_fail(*keys):
+    import time
+    now = time.time()
+    for k in keys:
+        rec = _FAILS.setdefault(k, {"times": []})
+        rec["times"] = [t for t in rec["times"] if now - t < WINDOW_SEC] + [now]
+        if len(rec["times"]) >= MAX_FAILS:
+            rec["locked_until"] = now + LOCK_SEC
+            rec["times"] = []
 
 
 @app.get("/api/auth/state")
@@ -63,23 +95,32 @@ def auth_state(request: Request):
 
 
 @app.post("/api/auth/setup")
-def auth_setup(response: Response, body: dict = Body(...)):
+def auth_setup(request: Request, response: Response, body: dict = Body(...)):
     if auth.user_count() > 0:
         raise HTTPException(400, "Already set up")
     u = auth.create_user(body.get("username"), body.get("password"), "admin", body.get("display_name"))
     auth.log(u, "setup")
-    _set_cookie(response, auth.new_session(u["id"]))
+    _set_cookie(request, response, auth.new_session(u["id"]))
     return {"user": auth.public_user(u)}
 
 
 @app.post("/api/auth/login")
-def login(response: Response, body: dict = Body(...)):
-    u = db.q("SELECT * FROM users WHERE lower(username)=lower(?)", ((body.get("username") or "").strip(),), one=True)
+def login(request: Request, response: Response, body: dict = Body(...)):
+    name = (body.get("username") or "").strip()
+    ip = _client_ip(request)
+    # lock per IP and per account-from-that-IP, so nobody can lock a real user out from elsewhere
+    keys = ("ip:" + ip, "user:" + name.lower() + "@" + ip)
+    _check_locked(*keys)
+    u = db.q("SELECT * FROM users WHERE lower(username)=lower(?)", (name,), one=True)
     if not u or not u["active"] or not auth.check_password(body.get("password") or "", u["password_hash"]):
+        _record_fail(*keys)
+        auth.log(None, "login_failed", detail={"username": name, "ip": _client_ip(request)})
         raise HTTPException(401, "用户名或密码错误 / Wrong username or password")
+    for k in keys:
+        _FAILS.pop(k, None)
     db.ex("UPDATE users SET last_login=? WHERE id=?", (db.now(), u["id"]))
-    auth.log(u, "login")
-    _set_cookie(response, auth.new_session(u["id"]))
+    auth.log(u, "login", detail={"ip": _client_ip(request)})
+    _set_cookie(request, response, auth.new_session(u["id"]))
     return {"user": auth.public_user(u)}
 
 

@@ -19,7 +19,7 @@ const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
 const ROLES = ['admin', 'editor', 'viewer'];
 const ACTIONS = ['upload', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
-  'lifecycle_status', 'notes', 'login', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
+  'lifecycle_status', 'notes', 'login', 'login_failed', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
 const RANK = { viewer: 1, editor: 2, admin: 3 };
 const can = role => !!store.user && RANK[store.user.role] >= RANK[role];
 
@@ -135,6 +135,8 @@ const AuditDetail = {
       if (r.action === 'extract_failed') return d.error;
       if (r.action === 'upload' || r.action === 'delete') return d.file === r.contract_label ? '' : d.file;
       if (r.action === 'export') return d.contracts + ' contracts';
+      if (r.action === 'login') return d.ip ? 'IP ' + d.ip : '';
+      if (r.action === 'login_failed') return (d.username || '') + (d.ip ? ' · IP ' + d.ip : '');
       if (r.action === 'settings') return Object.keys(d).join(', ');
       return '';
     });
@@ -815,7 +817,7 @@ const AuditView = {
         <el-table-column :label="t('time')" width="190"><template #default="{ row }"><span class="num">{{ row.ts }}</span></template></el-table-column>
         <el-table-column :label="t('user')" width="120"><template #default="{ row }">{{ who(row.username) }}</template></el-table-column>
         <el-table-column :label="t('action')" width="150"><template #default="{ row }">
-          <el-tag size="small" :type="row.action === 'confirm' ? 'success' : row.action === 'edit' ? 'warning' : ['delete','extract_failed'].includes(row.action) ? 'danger' : 'info'" effect="plain">{{ t('a_' + row.action) }}</el-tag></template></el-table-column>
+          <el-tag size="small" :type="row.action === 'confirm' ? 'success' : row.action === 'edit' ? 'warning' : ['delete','extract_failed','login_failed'].includes(row.action) ? 'danger' : 'info'" effect="plain">{{ t('a_' + row.action) }}</el-tag></template></el-table-column>
         <el-table-column :label="t('target')" min-width="200"><template #default="{ row }">
           <a v-if="row.contract_id && row.action !== 'delete'" href="javascript:void 0" @click="go('detail', row.contract_id, { tab: 'history' })">{{ row.contract_label || ('#' + row.contract_id) }}</a>
           <span v-else class="muted">{{ row.contract_label }}</span></template></el-table-column>
