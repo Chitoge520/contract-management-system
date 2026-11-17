@@ -73,8 +73,10 @@ def check_password(pw: str, stored: str) -> bool:
 
 
 def validate_password(pw: str):
-    if not pw or len(pw) < 6:
-        raise HTTPException(400, "密码至少 6 位 / Password must be at least 6 characters")
+    import re
+    if not pw or len(pw) < 10 or not re.search(r"[A-Za-z]", pw) or not re.search(r"\d", pw):
+        raise HTTPException(400, "密码至少 10 位，且需同时包含字母和数字 / "
+                                 "Password needs at least 10 characters with both letters and digits")
 
 
 # ---------------- users ----------------
