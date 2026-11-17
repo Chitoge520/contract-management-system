@@ -1,0 +1,7 @@
+.venv/
+data/
+__pycache__/
+start.log
+pip.log
+*.pdf
+*.docx
