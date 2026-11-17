@@ -1000,13 +1000,18 @@ const Root = {
                 <span class="avatar">{{ (store.user.display_name || store.user.username).slice(0, 1).toUpperCase() }}</span>
                 <span class="me-text"><span class="me-name">{{ store.user.display_name || store.user.username }}</span>
                   <span class="me-role">{{ t('r_' + store.user.role) }}</span></span>
+                <el-icon class="me-more"><ArrowUp /></el-icon>
               </button>
               <template #dropdown><el-dropdown-menu>
-                <el-dropdown-item command="lang">{{ t('lang') }}</el-dropdown-item>
                 <el-dropdown-item command="pw">{{ t('changePw') }}</el-dropdown-item>
+                <el-dropdown-item command="lang">{{ t('lang') }}</el-dropdown-item>
                 <el-dropdown-item command="logout" divided>{{ t('logout') }}</el-dropdown-item>
               </el-dropdown-menu></template>
             </el-dropdown>
+            <div class="foot-actions">
+              <button type="button" @click="toggleLang"><el-icon><Switch /></el-icon>{{ t('lang') }}</button>
+              <button type="button" @click="onUserCmd('logout')"><el-icon><SwitchButton /></el-icon>{{ t('logout') }}</button>
+            </div>
           </div>
         </aside>
         <main class="main">

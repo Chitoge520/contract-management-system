@@ -192,3 +192,9 @@ mark { background: #FFE9A8; }
 .hit-main { flex: 1; min-width: 0; }
 .hit-amt { flex: none; min-width: 120px; text-align: right; font-weight: 600; }
 .hit .pg { flex: none; margin-top: 1px; }
+.me-more { margin-left: auto; color: #8EA0B2; }
+.foot-actions { display: flex; gap: 6px; margin-top: 8px; }
+.foot-actions button { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 4px; background: transparent;
+  border: 1px solid #33475B; color: #C9D3DD; border-radius: 6px; padding: 5px 6px; cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap; }
+.foot-actions button:hover { color: #fff; border-color: #5B6E82; background: rgba(255,255,255,.06); }
+@media (max-width: 760px) { .foot-actions { margin: 0 0 0 8px; } .nav-foot { display: flex; align-items: center; } }
