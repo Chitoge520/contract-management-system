@@ -12,6 +12,10 @@ if errorlevel 1 goto nogit
 if exist ".git" goto haverepo
 git init
 git remote add origin https://github.com/Chitoge520/contract-management-system.git
+rem Link this folder to the code already on GitHub (keeps your local files as they are)
+git fetch origin
+git reset origin/main
+git branch -M main
 
 :haverepo
 git config user.name >nul 2>nul
@@ -21,7 +25,6 @@ if errorlevel 1 git config user.email "Chitoge520@users.noreply.github.com"
 
 git add -A
 git commit -m "Update %date% %time%"
-git branch -M main
 git pull --rebase origin main 2>nul
 git push -u origin main
 if errorlevel 1 goto pushfail
