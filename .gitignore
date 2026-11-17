@@ -5,3 +5,8 @@ start.log
 pip.log
 *.pdf
 *.docx
+# never upload notes / keys kept next to the program
+*.txt
+!requirements.txt
+*.key
+.env
