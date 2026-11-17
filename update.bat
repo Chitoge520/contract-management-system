@@ -8,7 +8,7 @@ exit /b
 cd /d "%~dp0"
 where git >nul 2>nul
 if errorlevel 1 goto nogit
-if not exist ".git" goto norepo
+if not exist ".git" goto linkrepo
 git pull --ff-only origin main
 if errorlevel 1 goto fail
 ".venv\Scripts\python.exe" -m pip install -q -r requirements.txt 2>nul
@@ -16,13 +16,23 @@ echo.
 echo Updated. Close the "Contract Register" window and run start_lan.bat (or start.bat) again.
 goto end
 
-:norepo
-echo [ERROR] This folder was not downloaded with git clone, so it cannot update itself.
-echo   Download the latest ZIP from GitHub and copy it over this folder (keep the data folder).
+:linkrepo
+rem Folder was copied (e.g. from a USB stick): link it to GitHub once, then take the latest code
+echo Linking this folder to GitHub (first time only)...
+git init
+git remote add origin https://github.com/Chitoge520/contract-management-system.git
+git fetch origin main
+if errorlevel 1 goto fail
+git reset --hard FETCH_HEAD
+git branch -M main
+git branch --set-upstream-to=origin/main main
+".venv\Scripts\python.exe" -m pip install -q -r requirements.txt 2>nul
+echo.
+echo Updated. Close the "Contract Register" window and run start_lan.bat (or start.bat) again.
 goto end
 
 :fail
-echo [ERROR] Update failed. Files in this folder may have been edited by hand; tell the developer.
+echo [ERROR] Update failed. If a GitHub login window appeared, sign in and run update.bat again.
 goto end
 
 :nogit
