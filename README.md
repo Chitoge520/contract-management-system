@@ -51,6 +51,27 @@
 
 **金额明细** 页面顶部会自动核对“各项明细之和”是否等于“合同总额”，对不上会标红提示。
 
+## 部署到另一台内网电脑（作为正式服务器）
+
+这台电脑会成为大家共用的系统，同事都在浏览器里访问它。它需要保持开机，并且能上外网（第一次安装依赖、调用 AI 都要用到）。
+
+1. **安装软件**
+   - Python 3.12 或更高版本：<https://www.python.org/downloads/>，安装时勾选 **Add python.exe to PATH**。
+   - Git：<https://git-scm.com/download/win>，安装时一路默认即可。
+2. **下载代码**：在想放程序的位置（例如 `D:\`）空白处右键 → **在终端中打开**（或打开 Git Bash），运行：
+   ```
+   git clone https://github.com/Chitoge520/contract-management-system.git
+   ```
+   仓库是私有的，第一次会弹出 GitHub 登录窗口，用 Chitoge520 账号登录授权即可。
+3. **启动**：进入 `contract-management-system` 文件夹，双击 **`start_lan.bat`**。第一次会自动安装依赖（3–5 分钟）。Windows 防火墙弹窗时选择 **允许**。
+4. **初始化**：浏览器打开后创建管理员账号，然后在 **设置** 里填写 AI 的 API Key，在 **用户管理** 里给同事建账号。
+5. **告诉同事地址**：黑色窗口里显示的 `http://192.168.x.x:8000` 就是同事访问的地址。
+6. **开机自动启动（可选）**：按 `Win + R`，输入 `shell:startup` 回车，把 `start_lan.bat` 的**快捷方式**放进打开的文件夹。
+
+**以后更新版本**：双击 **`update.bat`** 下载最新代码，然后关掉黑色窗口，重新双击 `start_lan.bat`。`data` 文件夹里的合同、账号和设置不受影响。
+
+**注意**：每台电脑的 `data` 文件夹相互独立。笔记本上的数据不会自动出现在服务器上；如果需要迁移，用 **设置 → 下载备份**，把备份里的 `data` 文件夹放到服务器的程序目录。
+
 ## 数据与隐私
 
 - 所有数据都在程序目录下的 `data` 文件夹里：
@@ -81,5 +102,7 @@ app/            程序代码（Python 后端 + Vue3/Element Plus 前端，已内
 data/           数据（首次运行自动创建）
 start.bat       启动（仅本机访问）
 start_lan.bat   启动（同事可通过内网访问）
+update.bat      从 GitHub 下载最新代码
+push.bat        把本机改过的代码上传到 GitHub
 requirements.txt
 ```
