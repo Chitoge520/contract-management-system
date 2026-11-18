@@ -209,14 +209,41 @@ const DataTable = {
   </div>`,
 };
 
+// ---------- one login per browsing session ----------
+// sessionStorage lives as long as the tab (it survives a reload, not closing the tab). A tab that opens
+// without the flag asks the other open tabs of the system; if none answers, the old login is ended.
+const TAB_ID = Math.random().toString(36).slice(2);
+const tabChannel = window.BroadcastChannel ? new BroadcastChannel('cms_tabs') : null;
+function tabAlive() { try { return sessionStorage.getItem('cms_alive') === '1'; } catch (e) { return false; } }
+function markTabAlive(on) { try { on ? sessionStorage.setItem('cms_alive', '1') : sessionStorage.removeItem('cms_alive'); } catch (e) {} }
+if (tabChannel) tabChannel.onmessage = e => {
+  if (e.data && e.data.ping && e.data.from !== TAB_ID && tabAlive()) tabChannel.postMessage({ here: true, to: e.data.from });
+};
+function otherTabOpen() {
+  return new Promise(resolve => {
+    if (!tabChannel) return resolve(false);
+    const ch = new BroadcastChannel('cms_tabs');
+    const done = v => { clearTimeout(timer); ch.close(); resolve(v); };
+    const timer = setTimeout(() => done(false), 400);
+    ch.onmessage = e => { if (e.data && e.data.here && e.data.to === TAB_ID) done(true); };
+    ch.postMessage({ ping: true, from: TAB_ID });
+  });
+}
+
 // ---------- login / setup ----------
 const AuthView = {
   mixins: [mixin],
   setup() {
     // mode: login | register | done (registration submitted); first run uses the setup form
     const mode = ref('login');
-    const f = reactive({ username: '', password: '', password2: '', display_name: '', employee_no: '' });
+    const f = reactive({ username: '', password: '', password2: '', display_name: '', employee_no: '', captcha: '' });
     const busy = ref(false);
+    const cap = reactive({ id: '', image: '' });
+    async function loadCaptcha() {
+      f.captcha = '';
+      try { Object.assign(cap, await api('/api/auth/captcha')); } catch (e) { ElMessage.error(e.message); }
+    }
+    onMounted(() => { if (!store.needsSetup) loadCaptcha(); });
     const rules = computed(() => ({
       user: /^[A-Za-z0-9]{3,32}$/.test(f.username),
       len: f.password.length >= 10,
@@ -230,27 +257,28 @@ const AuthView = {
       const r = rules.value;
       return r.user && r.len && r.letter && r.digit && r.same && r.emp && !!f.display_name.trim();
     });
-    function reset() { Object.assign(f, { username: '', password: '', password2: '', display_name: '', employee_no: '' }); }
-    function switchTo(m) { mode.value = m; reset(); }
+    function reset() { Object.assign(f, { username: '', password: '', password2: '', display_name: '', employee_no: '', captcha: '' }); }
+    function switchTo(m) { mode.value = m; reset(); if (m !== 'done') loadCaptcha(); }
     async function submit() {
       if (isForm.value && !formOk.value) { ElMessage.error(t('fixForm')); return; }
+      if (!store.needsSetup && !f.captcha.trim()) { ElMessage.error(t('captchaPh')); return; }
       busy.value = true;
       try {
         if (store.needsSetup) {
           const r = await api('/api/auth/setup', { method: 'POST', json: { username: f.username, password: f.password, display_name: f.display_name, employee_no: f.employee_no.trim() } });
           store.user = r.user; store.needsSetup = false;
         } else if (mode.value === 'register') {
-          await api('/api/auth/register', { method: 'POST', json: { username: f.username, password: f.password, password2: f.password2, display_name: f.display_name, employee_no: f.employee_no.trim() } });
+          await api('/api/auth/register', { method: 'POST', json: { username: f.username, password: f.password, password2: f.password2, display_name: f.display_name, employee_no: f.employee_no.trim(), captcha_id: cap.id, captcha: f.captcha } });
           mode.value = 'done';
         } else {
-          const r = await api('/api/auth/login', { method: 'POST', json: { username: f.username, password: f.password } });
+          const r = await api('/api/auth/login', { method: 'POST', json: { username: f.username, password: f.password, captcha_id: cap.id, captcha: f.captcha } });
           store.user = r.user;
         }
-      } catch (e) { ElMessage.error(e.message); }
+      } catch (e) { ElMessage.error(e.message); if (!store.needsSetup) loadCaptcha(); }  // a captcha works only once
       busy.value = false;
     }
     function toggleLang() { store.lang = store.lang === 'zh' ? 'en' : 'zh'; try { localStorage.setItem('cms_lang', store.lang); } catch (e) {} }
-    return { mode, f, busy, rules, isForm, formOk, submit, switchTo, store, toggleLang };
+    return { mode, f, busy, rules, isForm, formOk, submit, switchTo, store, toggleLang, cap, loadCaptcha };
   },
   template: `
   <div class="auth-page">
@@ -291,6 +319,12 @@ const AuthView = {
           <el-form-item v-if="isForm" :label="t('passwordAgain')">
             <el-input v-model="f.password2" type="password" show-password autocomplete="new-password" />
             <div v-if="f.password2" class="rule" :class="{ ok: rules.same, bad: !rules.same }">{{ rules.same ? '✓ ' + t('pwSame') : '✗ ' + t('pwMismatch') }}</div>
+          </el-form-item>
+          <el-form-item v-if="!store.needsSetup" :label="t('captcha')">
+            <div class="captcha-row">
+              <el-input v-model="f.captcha" maxlength="4" autocomplete="off" :placeholder="t('captchaPh')" />
+              <img v-if="cap.image" :src="cap.image" class="captcha-img" :alt="t('captcha')" :title="t('captchaRefresh')" @click="loadCaptcha" />
+            </div>
           </el-form-item>
           <el-button type="primary" size="large" class="w100" :loading="busy" native-type="submit" :disabled="isForm && !formOk">
             {{ store.needsSetup ? t('setupBtn') : mode === 'register' ? t('submitRegister') : t('login') }}</el-button>
@@ -1510,11 +1544,19 @@ const Root = {
     function sync() { store.route = parseHash(); window.scrollTo(0, 0); }
     window.addEventListener('hashchange', sync); sync();
     async function checkAuth() {
-      try { const s = await api('/api/auth/state'); store.user = s.user; store.needsSetup = s.needs_setup; }
+      try {
+        const s = await api('/api/auth/state');
+        if (s.user && !tabAlive() && !(await otherTabOpen())) {  // reopened after every page was closed
+          await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+          s.user = null;
+        }
+        store.user = s.user; store.needsSetup = s.needs_setup;
+      }
       catch (e) { store.user = null; }
       store.authChecked = true;
     }
     onMounted(checkAuth);
+    watch(() => store.user && store.user.id, id => markTabAlive(!!id));
     async function pollPending() {
       if (store.user && store.user.role === 'admin') {
         try { store.pendingCount = (await api('/api/users/pending/count')).count; } catch (e) {}

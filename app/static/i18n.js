@@ -43,6 +43,7 @@ window.I18N = {
     backupTitle: '备份', backupText: '下载包含数据库和全部合同原件的压缩包。恢复时把压缩包里的 data 文件夹覆盖到程序目录即可。', backupBtn: '下载备份',
 
     navAudit: '审计日志', navUsers: '用户与权限',
+    captcha: '验证码', captchaPh: '请输入图中的 4 个字符', captchaRefresh: '看不清？点击换一张',
     login: '登录', loginTitle: '登录合同管理系统', username: '用户名', password: '密码', displayName: '姓名',
     setupTitle: '创建管理员账号', setupText: '第一次使用，请先创建管理员账号。管理员可以添加其他用户。', setupBtn: '创建并进入系统',
     passwordAgain: '再次输入密码', pwMismatch: '两次输入的密码不一致', logout: '退出登录', changePw: '修改密码',
@@ -159,6 +160,7 @@ window.I18N = {
     backupTitle: 'Backup', backupText: 'Download a zip with the database and all original files. To restore, copy its data folder over the program folder.', backupBtn: 'Download backup',
 
     navAudit: 'Audit log', navUsers: 'Users & permissions',
+    captcha: 'Verification code', captchaPh: 'Enter the 4 characters in the picture', captchaRefresh: 'Hard to read? Click for a new one',
     login: 'Sign in', loginTitle: 'Sign in to Contract Register', username: 'Username', password: 'Password', displayName: 'Name',
     setupTitle: 'Create the admin account', setupText: 'First time here. Create the administrator account; the admin can add other users.', setupBtn: 'Create and continue',
     passwordAgain: 'Repeat password', pwMismatch: 'Passwords do not match', logout: 'Sign out', changePw: 'Change password',
