@@ -195,13 +195,16 @@ def logout(request: Request, response: Response):
 
 
 @app.post("/api/auth/password")
-def change_password(body: dict = Body(...), user=Depends(current_user)):
+def change_password(response: Response, body: dict = Body(...), user=Depends(current_user)):
     if not auth.check_password(body.get("old_password") or "", user["password_hash"]):
         raise HTTPException(400, "原密码不正确 / Current password is wrong")
     auth.validate_password(body.get("new_password"))
     db.ex("UPDATE users SET password_hash=? WHERE id=?", (auth.hash_password(body["new_password"]), user["id"]))
+    # every login of this user ends, including this one: sign in again with the new password
+    db.ex("DELETE FROM sessions WHERE user_id=?", (user["id"],))
     auth.log(user, "password_change")
-    return {"ok": True}
+    response.delete_cookie(auth.SESSION_COOKIE)
+    return {"ok": True, "relogin": True}
 
 
 # ================= users (admin) =================
@@ -535,18 +538,22 @@ def _hits(cid, data, words):
     return hits
 
 
-@app.get("/api/contracts")
-def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "", lifecycle: str = "", year: str = "",
-                   dept: str = "", user=Depends(current_user)):
+# the year a contract is filed under: signing date, else effective date, else start date, else upload date
+YEAR_SQL = "substr(coalesce(contracts.signing_date, contracts.effective_date, contracts.start_date, contracts.uploaded_at),1,4)"
+
+
+def _contract_filter(user, q="", type="", party="", status="", lifecycle="", year="", dept=""):
+    """WHERE clause (and args) for the contract list and the Excel export, limited to what the user may see."""
     cond, args = access.visible_sql(user, "contracts")
-    sql = "SELECT * FROM contracts WHERE " + cond
+    sql = cond
     if dept == "none":
         sql += " AND NOT EXISTS (SELECT 1 FROM contract_departments cd WHERE cd.contract_id=contracts.id)"
     elif dept:
+        if not str(dept).isdigit():
+            raise HTTPException(400, "Invalid department")
         sql += " AND EXISTS (SELECT 1 FROM contract_departments cd WHERE cd.contract_id=contracts.id AND cd.department_id=?)"
         args.append(int(dept))
-    words = q.split()
-    for word in words:
+    for word in q.split():
         like = f"%{word.lower()}%"
         sql += (" AND (lower(coalesce(file_name,'')||' '||coalesce(contract_no,'')||' '||coalesce(title,'')||' '||"
                 "coalesce(title_zh,'')||' '||coalesce(party_a,'')||' '||coalesce(party_b,'')||' '||coalesce(notes,'')||' '||"
@@ -565,19 +572,41 @@ def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "
         sql += " AND lifecycle_status=?"
         args.append(lifecycle)
     if year:
-        sql += " AND (substr(coalesce(signing_date, effective_date, start_date, uploaded_at),1,4)=?)"
-        args.append(year)
-    sql += " ORDER BY id DESC"
-    out = []
+        sql += f" AND {YEAR_SQL}=?"
+        args.append(str(year))
+    return sql, args
+
+
+CONTRACT_ORDER = f" ORDER BY {YEAR_SQL} DESC, contracts.id DESC"
+
+
+@app.get("/api/contracts")
+def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "", lifecycle: str = "", year: str = "",
+                   dept: str = "", page: int = 0, page_size: int = 0, user=Depends(current_user)):
+    """Newest year first. With page_size the answer is one page: {"total", "page", "page_size", "rows"};
+    without it, the whole list (used by the AI assistant's contract picker)."""
+    where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept)
+    sql = f"SELECT contracts.*, {YEAR_SQL} AS year FROM contracts WHERE {where}{CONTRACT_ORDER}"
+    total = None
+    if page_size > 0:
+        page_size = min(page_size, 200)
+        page = max(page, 1)
+        total = db.q(f"SELECT count(*) n FROM contracts WHERE {where}", args, one=True)["n"]
+        sql += " LIMIT ? OFFSET ?"
+        args = args + [page_size, (page - 1) * page_size]
     found = db.q(sql, args)
     depts = access.departments_map([r["id"] for r in found])
+    words = q.split()
+    out = []
     for r in found:
         row = _list_row(r)
         row["departments"] = depts.get(r["id"], [])
         if words:
             row["hits"] = _hits(r["id"], json.loads(r["data_json"]) if r.get("data_json") else {}, words)
         out.append(row)
-    return out
+    if total is None:
+        return out
+    return {"total": total, "page": page, "page_size": page_size, "rows": out}
 
 
 @app.post("/api/contracts")
@@ -721,17 +750,20 @@ def _xlsx_safe(v):
 
 
 @app.get("/api/export.xlsx")
-def export_xlsx(ids: str = "", user=Depends(require("contract.export"))):
+def export_xlsx(ids: str = "", q: str = "", type: str = "", party: str = "", status: str = "", lifecycle: str = "",
+                year: str = "", dept: str = "", user=Depends(require("contract.export"))):
+    """Export the given ids, or else every contract matching the list filters (all pages, not just the one shown)."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
 
-    allowed = set(access.visible_ids(user))
     if ids:
+        allowed = set(access.visible_ids(user))
         id_list = [int(x) for x in ids.split(",") if x.strip().isdigit() and int(x) in allowed]
         rows = [db.q("SELECT * FROM contracts WHERE id=?", (i,), one=True) for i in id_list]
         rows = [r for r in rows if r]
     else:
-        rows = [r for r in db.q("SELECT * FROM contracts ORDER BY id") if r["id"] in allowed]
+        where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept)
+        rows = db.q(f"SELECT contracts.* FROM contracts WHERE {where}{CONTRACT_ORDER}", args)
     auth.log(user, "export", detail={"contracts": len(rows)})
     wb = Workbook()
     head_font = Font(bold=True, color="FFFFFF")

@@ -406,21 +406,33 @@ const ListView = {
     const f = reactive({ q: store.route.query.q || '', type: '', party: '', year: '', status: '', lifecycle: '', dept: '' });
     const depts = ref([]);
     api('/api/departments').then(r => { depts.value = r; }).catch(() => {});
+    const page = ref(1); const total = ref(0);
+    const pageSize = ref((() => { try { return Number(localStorage.getItem('cms_page_size')) || 20; } catch (e) { return 20; } })());
+    // only the filters that are set: a cleared select is undefined, which must not be sent as the text "undefined"
+    function filterParams() {
+      const p = new URLSearchParams();
+      for (const k in f) if (f[k] !== undefined && f[k] !== null && String(f[k]).trim() !== '') p.set(k, f[k]);
+      return p;
+    }
     let timer = null, debounce = null, seq = 0;
     async function load() {
       const my = ++seq;
-      const p = new URLSearchParams(f).toString();
+      const p = filterParams(); p.set('page', page.value); p.set('page_size', pageSize.value);
       try {
-        const [r, s] = await Promise.all([api('/api/contracts?' + p), api('/api/stats')]);
+        const [r, s] = await Promise.all([api('/api/contracts?' + p.toString()), api('/api/stats')]);
         if (my !== seq) return;
-        rows.value = r; stats.value = s;
+        if (!r.rows.length && r.total && page.value > 1) { page.value = Math.ceil(r.total / pageSize.value); return load(); }
+        rows.value = r.rows; total.value = r.total; stats.value = s;
       } catch (e) { ElMessage.error(e.message); }
       loading.value = false;
       clearTimeout(timer);
       if (rows.value.some(r => WORKING.includes(r.status))) timer = setTimeout(load, 3000);
     }
-    watch(() => [f.type, f.party, f.year, f.status, f.lifecycle, f.dept], load);
-    watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(load, 300); });
+    function firstPage() { page.value = 1; load(); }
+    watch(() => [f.type, f.party, f.year, f.status, f.lifecycle, f.dept], firstPage);
+    watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(firstPage, 300); });
+    function onPage(n) { page.value = n; load(); window.scrollTo(0, 0); }
+    function onPageSize(n) { pageSize.value = n; try { localStorage.setItem('cms_page_size', n); } catch (e) {} firstPage(); }
     onMounted(load);
     onBeforeUnmount(() => clearTimeout(timer));
     const filtered = computed(() => !!(f.q || f.type || f.party || f.year || f.status || f.lifecycle || f.dept));
@@ -446,9 +458,10 @@ const ListView = {
     function onUploadError(err) { ElMessage.error(String(err && err.message || err)); finishOne(); }
     function onDialogClosed() { uploader.value && uploader.value.clearFiles(); Object.assign(up, { total: 0, done: 0, created: 0 }); }
 
-    function exportXlsx() { location.href = '/api/export.xlsx?ids=' + rows.value.map(r => r.id).join(','); }
+    // every contract that matches the filters, on all pages
+    function exportXlsx() { location.href = '/api/export.xlsx?' + filterParams().toString(); }
     function titleOf(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || r.file_name; }
-    return { depts, rows, stats, f, loading, filtered, searching, working, showUpload, uploader, up, onChange, onUploaded, onUploadError,
+    return { depts, rows, stats, f, loading, filtered, page, pageSize, total, onPage, onPageSize, searching, working, showUpload, uploader, up, onChange, onUploaded, onUploadError,
       onDialogClosed, exportXlsx, titleOf, TYPES, STATUSES, LIFECYCLES, WORKING, go };
   },
   template: `
@@ -488,6 +501,8 @@ const ListView = {
     <SearchResults v-if="searching && rows.length" :rows="rows" :q="f.q" />
     <div v-else class="panel" v-loading="loading">
       <el-table v-if="rows.length" :data="rows" @row-click="r => go('detail', r.id)" row-class-name="click" style="width:100%">
+        <el-table-column :label="t('year')" width="80">
+          <template #default="{ row }"><span class="num">{{ row.year || '—' }}</span></template></el-table-column>
         <el-table-column :label="t('contractNo')" width="160">
           <template #default="{ row }"><span class="mono-ish">{{ row.contract_no || '—' }}</span></template></el-table-column>
         <el-table-column :label="t('title')" min-width="300">
@@ -517,6 +532,11 @@ const ListView = {
         <h2>{{ t('emptyTitle') }}</h2><p>{{ t('emptyText') }}</p>
         <el-button v-if="can('contract.upload')" type="primary" size="large" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
       </div>
+    </div>
+
+    <div class="pager" v-if="total > 0">
+      <el-pagination background :current-page="page" :page-size="pageSize" :page-sizes="[20, 50, 100]" :total="total"
+        layout="total, sizes, prev, pager, next, jumper" @current-change="onPage" @size-change="onPageSize" />
     </div>
 
     <el-dialog v-model="showUpload" :title="t('uploadTitle')" width="560px" @closed="onDialogClosed">
@@ -1574,7 +1594,11 @@ const Root = {
     const pwDlg = ref(false); const pw = reactive({ old_password: '', new_password: '', again: '' });
     async function changePw() {
       if (pw.new_password !== pw.again) { ElMessage.error(t('pwMismatch')); return; }
-      try { await api('/api/auth/password', { method: 'POST', json: pw }); pwDlg.value = false; ElMessage.success(t('pwChanged')); Object.assign(pw, { old_password: '', new_password: '', again: '' }); }
+      try {
+        await api('/api/auth/password', { method: 'POST', json: pw });
+        pwDlg.value = false; Object.assign(pw, { old_password: '', new_password: '', again: '' });
+        ElMessage.success(t('pwChangedRelogin')); store.user = null; go('list');
+      }
       catch (e) { ElMessage.error(e.message); }
     }
     function onUserCmd(cmd) { if (cmd === 'logout') logout(); if (cmd === 'pw') pwDlg.value = true; if (cmd === 'lang') toggleLang(); }
