@@ -4,6 +4,7 @@ import io
 import queue
 import json
 import re
+import shutil
 import sqlite3
 import tempfile
 import zipfile
@@ -14,6 +15,7 @@ from typing import List
 from fastapi import Body, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from . import access, agent, auth, db, llm, pipeline
 from .auth import current_user, require
@@ -567,7 +569,9 @@ async def upload(files: List[UploadFile] = File(...), user=Depends(require("cont
         h = hashlib.sha256(content).hexdigest()
         dup = db.q("SELECT id, file_name FROM contracts WHERE file_hash=?", (h,), one=True)
         if dup:
-            duplicates.append({"file": f.filename, "existing_id": dup["id"]})
+            # only point to the existing contract if this user may see it; otherwise don't reveal that it exists
+            duplicates.append({"file": f.filename,
+                               "existing_id": dup["id"] if access.can_view(user, dup["id"]) else None})
             continue
         stored = f"{datetime.now():%Y%m%d%H%M%S}_{h[:10]}{ext}"
         (db.FILES_DIR / stored).write_bytes(content)
@@ -682,6 +686,16 @@ def stats(user=Depends(current_user)):
 
 
 # ================= export / backup =================
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _xlsx_safe(v):
+    """Text from contracts must never become an Excel formula: prefix risky strings with a quote."""
+    if isinstance(v, str) and v.startswith(_FORMULA_START):
+        return "'" + v
+    return v
+
+
 @app.get("/api/export.xlsx")
 def export_xlsx(ids: str = "", user=Depends(require("contract.export"))):
     from openpyxl import Workbook
@@ -705,7 +719,7 @@ def export_xlsx(ids: str = "", user=Depends(require("contract.export"))):
             c.font, c.fill = head_font, head_fill
             c.alignment = Alignment(vertical="center", wrap_text=True)
         for r in data:
-            ws.append(r)
+            ws.append([_xlsx_safe(v) for v in r])
         for i, w in enumerate(widths):
             ws.column_dimensions[chr(65 + i)].width = w
         ws.freeze_panes = "A2"
@@ -774,9 +788,13 @@ def backup(user=Depends(admin)):
     zpath = tmp / f"backup_{datetime.now():%Y%m%d_%H%M}.zip"
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(snap, "data/contracts.db")
+        if llm.CONFIG_PATH.exists():  # settings, so a restore works without setting everything up again
+            z.write(llm.CONFIG_PATH, "data/config.json")
         for f in db.FILES_DIR.iterdir():
             z.write(f, f"data/files/{f.name}")
-    return FileResponse(zpath, filename=zpath.name, media_type="application/zip")
+    # remove the temporary copy once the download has been sent
+    return FileResponse(zpath, filename=zpath.name, media_type="application/zip",
+                        background=BackgroundTask(shutil.rmtree, tmp, ignore_errors=True))
 
 
 # ================= AI assistant =================
