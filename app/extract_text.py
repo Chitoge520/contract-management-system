@@ -78,6 +78,43 @@ def read_docx(path):
     return [(1, "\n".join(parts), False)]
 
 
+class UnreadableFile(Exception):
+    """A file that cannot be read; the message is meant for the user."""
+
+
+def check_readable(ext, content):
+    """Raise UnreadableFile if the uploaded bytes cannot be read as this type. Called before anything is stored."""
+    if not content:
+        raise UnreadableFile("文件是空的 / The file is empty")
+    if ext == ".pdf":
+        try:
+            doc = fitz.open(stream=content, filetype="pdf")
+        except Exception:
+            raise UnreadableFile("PDF 无法打开，可能已损坏或不是真正的 PDF。请重新导出或扫描后再上传 / "
+                                 "The PDF cannot be opened; it may be damaged or not a real PDF. Export or scan it again")
+        try:
+            if doc.needs_pass:
+                raise UnreadableFile("PDF 设置了打开密码，请先去掉密码再上传 / The PDF is password-protected; remove the password first")
+            if doc.page_count < 1:
+                raise UnreadableFile("PDF 里没有页面 / The PDF has no pages")
+        finally:
+            doc.close()
+    elif ext == ".docx":
+        import io
+        import zipfile
+        try:
+            import docx
+            docx.Document(io.BytesIO(content))
+        except (zipfile.BadZipFile, KeyError, ValueError, Exception):
+            raise UnreadableFile("Word 文件无法打开，可能已损坏，或是旧版 .doc 改了扩展名。请用 Word 另存为 .docx 后再上传 / "
+                                 "The Word file cannot be opened; it may be damaged or an old .doc renamed. Save it as .docx again")
+    elif ext == ".txt":
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise UnreadableFile("文本文件不是 UTF-8 编码，请另存为 UTF-8 后再上传 / The text file is not UTF-8; save it as UTF-8")
+
+
 def read_any(path, on_progress=None):
     ext = Path(path).suffix.lower()
     if ext == ".pdf":

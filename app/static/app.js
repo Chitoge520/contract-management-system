@@ -7,7 +7,9 @@ const store = reactive({
   lang: (() => { try { return localStorage.getItem('cms_lang') || 'zh'; } catch (e) { return 'zh'; } })(),
   route: { name: 'list', id: null, query: {} },
   user: null, needsSetup: false, authChecked: false, pendingCount: 0,
+  vw: window.innerWidth,
 });
+window.addEventListener('resize', () => { store.vw = window.innerWidth; });
 function t(k, vars) {
   let s = (I18N[store.lang] && I18N[store.lang][k]) || I18N.zh[k] || k;
   if (vars) for (const v in vars) s = s.replace('{' + v + '}', vars[v]);
@@ -101,7 +103,7 @@ function who(name) { return name || t('system'); }
 const roleNames = reactive({});
 function roleName(key) { return ['admin', 'editor', 'viewer'].includes(key) ? t('r_' + key) : (roleNames[key] || key); }
 
-const mixin = { methods: { t, fmt, statusTag, can, who }, computed: { lang() { return store.lang; } } };
+const mixin = { methods: { t, fmt, statusTag, can, who }, computed: { lang() { return store.lang; }, vw() { return store.vw; } } };
 
 // ---------- small components ----------
 const PageRef = {
@@ -178,7 +180,7 @@ const AuditDetail = {
 const CURRENCIES = ['CNY', 'USD', 'EUR', 'ILS', 'HKD', 'GBP', 'JPY', 'SGD', 'AED', 'CHF', 'AUD', 'CAD'];
 const FieldInput = {
   mixins: [mixin],
-  props: { modelValue: null, kind: String, placeholder: String, append: String, size: String },
+  props: { modelValue: null, kind: String, placeholder: String, append: String, size: String, noFuture: Boolean },
   emits: ['update:modelValue'],
   setup(props, { emit }) {
     const numVal = computed(() => {
@@ -202,7 +204,8 @@ const FieldInput = {
   },
   template: `
   <el-date-picker v-if="kind === 'date'" :model-value="dateVal" @update:model-value="v => emit('update:modelValue', v || null)"
-    type="date" value-format="YYYY-MM-DD" :placeholder="legacyText || placeholder || 'YYYY-MM-DD'" :size="size" clearable style="width:100%" />
+    type="date" value-format="YYYY-MM-DD" :placeholder="legacyText || placeholder || 'YYYY-MM-DD'" :size="size" clearable style="width:100%"
+    :disabled-date="noFuture ? (d => d > new Date()) : undefined" />
   <el-select v-else-if="kind === 'currency'" :model-value="modelValue || ''" @update:model-value="setCurrency" filterable allow-create
     default-first-option clearable :placeholder="placeholder || t('currency')" :size="size" style="width:100%">
     <el-option v-for="c in CURRENCIES" :key="c" :value="c" :label="c" /></el-select>
@@ -497,7 +500,8 @@ const ListView = {
     }
     function onUploaded(res) {
       (res.duplicates || []).forEach(d => ElMessage.warning(t('duplicate', { f: d.file })));
-      (res.rejected || []).forEach(x => ElMessage.error(t('rejected', { f: x })));
+      (res.rejected || []).forEach(x => ElMessage.error({ message: typeof x === 'string' ? t('uploadRejected', { f: x }) : x.file + '：' + x.reason,
+        duration: 10000, showClose: true }));
       up.created += (res.created || []).length;
       finishOne();
     }
@@ -547,35 +551,36 @@ const ListView = {
     <SearchResults v-if="searching && rows.length" :rows="rows" :q="f.q" />
     <div v-else class="panel" v-loading="loading">
       <el-table v-if="rows.length" :data="rows" @row-click="r => go('detail', r.id)" row-class-name="click" style="width:100%">
-        <el-table-column :label="t('year')" width="80">
+        <el-table-column :label="t('year')" width="66">
           <template #default="{ row }"><span class="num">{{ row.year || '—' }}</span></template></el-table-column>
-        <el-table-column :label="t('contractNo')" width="160">
+        <el-table-column :label="t('contractNo')" width="145">
           <template #default="{ row }"><span class="mono-ish">{{ row.contract_no || '—' }}</span></template></el-table-column>
-        <el-table-column :label="t('title')" min-width="300">
+        <el-table-column :label="t('title')" min-width="220">
           <template #default="{ row }">
             <div class="t-title">{{ titleOf(row) }}</div>
             <div class="muted small" v-if="WORKING.includes(row.status)">{{ row.progress }}</div>
           </template></el-table-column>
-        <el-table-column :label="t('type')" width="110">
+        <el-table-column v-if="vw >= 1300" :label="t('type')" width="90">
           <template #default="{ row }"><el-tag v-if="row.contract_type" type="info" effect="plain" size="small">{{ t('t_' + row.contract_type) }}</el-tag></template></el-table-column>
-        <el-table-column :label="t('partyB')" prop="party_b" min-width="200" show-overflow-tooltip />
-        <el-table-column v-if="depts.length" :label="t('department')" min-width="120">
+        <el-table-column :label="t('partyB')" prop="party_b" min-width="160" show-overflow-tooltip />
+        <el-table-column v-if="depts.length && vw >= 1500" :label="t('department')" min-width="110">
           <template #default="{ row }">
             <template v-if="(row.departments || []).length"><el-tag v-for="d in row.departments" :key="d.id" size="small" effect="plain" class="mr-xs">{{ d.name }}</el-tag></template>
             <span v-else class="muted small">{{ t('companyWide') }}</span>
           </template></el-table-column>
-        <el-table-column :label="t('totalAmount')" width="170" align="right">
-          <template #default="{ row }"><span class="num">{{ fmt(row.total_amount, row.currency) }}</span></template></el-table-column>
-        <el-table-column :label="t('payProgress')" width="100">
+        <el-table-column :label="t('totalAmount')" width="165" align="right">
+          <template #default="{ row }"><span v-if="row.total_amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.total_amount) }}</span></span></template></el-table-column>
+        <el-table-column :label="t('payProgress')" width="90">
           <template #default="{ row }"><template v-if="row.payments">
             <span :class="{ danger: row.payments.overdue }">{{ row.payments.paid }}/{{ row.payments.total }}</span>
             <el-tag v-if="row.payments.overdue" type="danger" size="small" effect="plain" class="ml-xs">{{ t('payOverdue') }}</el-tag>
+            <el-tag v-if="row.payments.incomplete" type="warning" size="small" effect="plain" class="ml-xs">{{ t('ps_incomplete') }}</el-tag>
           </template></template></el-table-column>
-        <el-table-column :label="t('signingDate')" width="110">
+        <el-table-column v-if="vw >= 1440" :label="t('signingDate')" width="105">
           <template #default="{ row }">{{ row.signing_date || row.effective_date || '—' }}</template></el-table-column>
-        <el-table-column :label="t('status')" width="120">
+        <el-table-column :label="t('status')" width="96" :fixed="vw >= 640 ? 'right' : false">
           <template #default="{ row }"><el-tag :type="statusTag(row.status)" size="small">{{ t('s_' + row.status) }}</el-tag></template></el-table-column>
-        <el-table-column :label="t('reviewedBy')" width="100">
+        <el-table-column v-if="vw >= 1600" :label="t('reviewedBy')" width="90">
           <template #default="{ row }"><span class="muted">{{ row.confirmed_by || '' }}</span></template></el-table-column>
       </el-table>
       <el-empty v-else-if="!loading && filtered" :description="t('noMatch')" />
@@ -587,7 +592,8 @@ const ListView = {
 
     <div class="pager" v-if="total > 0">
       <el-pagination background :current-page="page" :page-size="pageSize" :page-sizes="[20, 50, 100]" :total="total"
-        layout="total, sizes, prev, pager, next, jumper" @current-change="onPage" @size-change="onPageSize" />
+        :layout="vw < 640 ? 'total, prev, pager, next' : vw < 1024 ? 'total, sizes, prev, pager, next' : 'total, sizes, prev, pager, next, jumper'"
+        :pager-count="vw < 640 ? 5 : 7" :size="vw < 640 ? 'small' : 'default'" @current-change="onPage" @size-change="onPageSize" />
     </div>
 
     <el-dialog v-model="showUpload" :title="t('uploadTitle')" width="560px" @closed="onDialogClosed">
@@ -606,6 +612,13 @@ const PAY_FIELDS = { seq: null, trigger_zh: '', trigger_en: '', percentage: null
   due_date: '', status: 'pending', paid_amount: null, paid_date: '', note: '' };
 function todayStr() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
 function payOverdue(p, today) { return p.status !== 'paid' && p.due_date && p.due_date < (today || todayStr()); }
+// paid / incomplete (marked paid but amount, date or currency missing) / overdue / pending — same rule as the server
+function payState(p, today) {
+  if (p.state) return p.state;
+  if (p.status === 'paid') return (num(p.paid_amount) > 0 && p.paid_date && p.currency) ? 'paid' : 'incomplete';
+  return payOverdue(p, today) ? 'overdue' : 'pending';
+}
+const PAY_TAG = { paid: 'success', incomplete: 'warning', overdue: 'danger', pending: 'info' };
 function payLabel(p) { return (store.lang === 'zh' ? (p.trigger_zh || p.trigger_en) : (p.trigger_en || p.trigger_zh)) || '—'; }
 function fileSize(n) { return n == null ? '' : n < 1024 * 1024 ? Math.max(1, Math.round(n / 1024)) + ' KB' : (n / 1024 / 1024).toFixed(1) + ' MB'; }
 function sumsByCurrency(rows, key) {
@@ -629,9 +642,24 @@ const PaymentDialog = {
     });
     function setPaid(v) {
       f.status = v;
-      if (v === 'paid') { if (f.paid_amount === null || f.paid_amount === '') f.paid_amount = f.amount; if (!f.paid_date) f.paid_date = todayStr(); }
+      if (v === 'paid') {
+        if ((f.paid_amount === null || f.paid_amount === '') && num(f.amount) > 0) f.paid_amount = num(f.amount);
+        if (!f.paid_date) f.paid_date = todayStr();
+        if (!f.currency) f.currency = props.currency || '';
+      }
+    }
+    function problems() {
+      if (f.status !== 'paid') return [];
+      const out = [];
+      if (!(num(f.paid_amount) > 0)) out.push(t('payPaidAmount'));
+      if (!f.paid_date) out.push(t('payPaidDate'));
+      if (!f.currency) out.push(t('currency'));
+      return out;
     }
     async function save() {
+      const missing = problems();
+      if (missing.length) { ElMessage.error(t('payNeed', { f: missing.join('、') })); return; }
+      if (f.status === 'paid' && f.paid_date > todayStr()) { ElMessage.error(t('payNoFuture')); return; }
       saving.value = true;
       try {
         const body = { ...f };
@@ -671,8 +699,9 @@ const PaymentDialog = {
         </el-radio-group>
       </div>
       <template v-if="f.status === 'paid'">
-        <el-form-item :label="t('payPaidAmount')"><FieldInput v-model="f.paid_amount" kind="pos" :append="f.currency" /></el-form-item>
-        <el-form-item :label="t('payPaidDate')"><FieldInput v-model="f.paid_date" kind="date" /></el-form-item>
+        <el-form-item :label="t('payPaidAmount')" required><FieldInput v-model="f.paid_amount" kind="pos" :append="f.currency" /></el-form-item>
+        <el-form-item :label="t('payPaidDate')" required><FieldInput v-model="f.paid_date" kind="date" no-future /></el-form-item>
+        <el-form-item :label="t('currency')" required><FieldInput v-model="f.currency" kind="currency" /></el-form-item>
       </template>
       <el-form-item :label="t('payNote')"><el-input v-model="f.note" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }" /></el-form-item>
       <el-divider content-position="left">{{ t('payNodeInfo') }}</el-divider>
@@ -684,7 +713,7 @@ const PaymentDialog = {
         <el-form-item :label="t('payPlanned')"><FieldInput v-model="f.amount" kind="pos" :append="f.currency" /></el-form-item>
       </div>
       <div class="pay-grid">
-        <el-form-item :label="t('currency')"><FieldInput v-model="f.currency" kind="currency" /></el-form-item>
+        <el-form-item v-if="f.status !== 'paid'" :label="t('currency')"><FieldInput v-model="f.currency" kind="currency" /></el-form-item>
         <el-form-item :label="t('payDue')"><FieldInput v-model="f.due_date" kind="date" /></el-form-item>
       </div>
       <el-form-item :label="t('payDueRule')"><el-input v-model="f.due_rule" /></el-form-item>
@@ -726,10 +755,11 @@ const PaymentPanel = {
     }
     onMounted(load);
     watch(() => props.working, (now, before) => { if (before && !now) load(); });  // AI finished: nodes may have changed
-    const paid = computed(() => rows.value.filter(r => r.status === 'paid'));
-    const overdue = computed(() => rows.value.filter(r => payOverdue(r, today.value)).length);
+    const paid = computed(() => rows.value.filter(r => payState(r, today.value) === 'paid'));
+    const overdue = computed(() => rows.value.filter(r => payState(r, today.value) === 'overdue').length);
+    const incomplete = computed(() => rows.value.filter(r => payState(r, today.value) === 'incomplete').length);
     function open(p) { current.value = p; dlg.value = true; }
-    return { rows, today, loading, dlg, current, paid, overdue, open, load, payOverdue, payLabel, sumsByCurrency };
+    return { rows, today, loading, dlg, current, paid, overdue, incomplete, open, load, payOverdue, payState, PAY_TAG, payLabel, sumsByCurrency };
   },
   template: `
   <div class="card" v-loading="loading">
@@ -742,6 +772,7 @@ const PaymentPanel = {
       <div><div class="k">{{ t('payPlannedTotal') }}</div><div class="v num">{{ sumsByCurrency(rows, 'amount') }}</div></div>
       <div><div class="k">{{ t('payPaidTotal') }}</div><div class="v num">{{ sumsByCurrency(paid, 'paid_amount') }}</div></div>
       <div v-if="overdue"><div class="k">{{ t('payOverdue') }}</div><div class="v danger">{{ overdue }}</div></div>
+      <div v-if="incomplete"><div class="k">{{ t('ps_incomplete') }}</div><div class="v warn">{{ incomplete }}</div></div>
     </div>
     <el-table v-if="rows.length" :data="rows" size="small" style="width:100%" :row-class-name="({ row }) => payOverdue(row, today) ? 'row-overdue' : ''">
       <el-table-column :label="t('paySeq')" width="56" prop="seq" />
@@ -752,22 +783,20 @@ const PaymentPanel = {
           <div class="muted small" v-if="row.note">{{ t('payNote') }}：{{ row.note }}</div>
         </template></el-table-column>
       <el-table-column :label="t('payPct')" width="70" align="right"><template #default="{ row }">{{ row.percentage != null ? row.percentage + '%' : '' }}</template></el-table-column>
-      <el-table-column :label="t('payPlanned')" width="140" align="right"><template #default="{ row }"><span class="num">{{ fmt(row.amount, row.currency) }}</span></template></el-table-column>
+      <el-table-column :label="t('payPlanned')" width="150" align="right"><template #default="{ row }"><span v-if="row.amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.amount) }}</span></span></template></el-table-column>
       <el-table-column :label="t('payDue')" width="110"><template #default="{ row }"><span :class="{ danger: payOverdue(row, today) }">{{ row.due_date || '—' }}</span></template></el-table-column>
       <el-table-column :label="t('payStatus')" width="100">
         <template #default="{ row }">
-          <el-tag v-if="row.status === 'paid'" type="success" size="small">{{ t('ps_paid') }}</el-tag>
-          <el-tag v-else-if="payOverdue(row, today)" type="danger" size="small">{{ t('payOverdue') }}</el-tag>
-          <el-tag v-else type="info" size="small">{{ t('ps_pending') }}</el-tag>
+          <el-tag :type="PAY_TAG[payState(row, today)]" size="small">{{ t('ps_' + payState(row, today)) }}</el-tag>
         </template></el-table-column>
       <el-table-column :label="t('payPaid')" width="150">
         <template #default="{ row }"><template v-if="row.status === 'paid'">
-          <div class="num">{{ fmt(row.paid_amount, row.currency) }}</div><div class="muted small">{{ row.paid_date }}</div></template></template></el-table-column>
-      <el-table-column :label="t('payProof')" width="160">
+          <div><span v-if="row.paid_amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.paid_amount) }}</span></span><span v-if="row.paid_amount == null">—</span></div><div class="muted small">{{ row.paid_date || '—' }}</div></template></template></el-table-column>
+      <el-table-column :label="t('payProofShort')" width="150">
         <template #default="{ row }">
           <div v-for="fl in row.files" :key="fl.id" class="proof-link"><a :href="'/api/payment-files/' + fl.id" target="_blank" rel="noopener" :title="fl.file_name"><el-icon><Paperclip /></el-icon>{{ fl.file_name }}</a></div>
         </template></el-table-column>
-      <el-table-column v-if="can('payment.record')" width="80" align="right">
+      <el-table-column v-if="can('payment.record')" width="76" align="center" :fixed="vw >= 640 ? 'right' : false">
         <template #default="{ row }"><el-button size="small" :type="row.status === 'paid' ? '' : 'primary'" plain @click="open(row)">{{ t('payRecord') }}</el-button></template></el-table-column>
     </el-table>
     <div v-else-if="!loading" class="muted small pay-empty">{{ working ? t('payWaitAI') : t('payNone') }}</div>
@@ -805,7 +834,7 @@ const PaymentsView = {
       catch (e) { ElMessage.error(e.message); }
     }
     function onPage(n) { page.value = n; load(); window.scrollTo(0, 0); }
-    return { f, rows, total, page, pageSize, today, loading, years, dlg, current, load, firstPage, contractLabel, open, onPage, go, payOverdue, payLabel };
+    return { f, rows, total, page, pageSize, today, loading, years, dlg, current, load, firstPage, contractLabel, open, onPage, go, payOverdue, payState, PAY_TAG, payLabel };
   },
   template: `
   <div>
@@ -813,8 +842,9 @@ const PaymentsView = {
     <div class="filters">
       <el-radio-group v-model="f.status">
         <el-radio-button value="pending">{{ t('ps_pending') }}</el-radio-button>
-        <el-radio-button value="overdue">{{ t('payOverdue') }}</el-radio-button>
+        <el-radio-button value="overdue">{{ t('ps_overdue') }}</el-radio-button>
         <el-radio-button value="due30">{{ t('payDue30') }}</el-radio-button>
+        <el-radio-button value="incomplete">{{ t('ps_incomplete') }}</el-radio-button>
         <el-radio-button value="paid">{{ t('ps_paid') }}</el-radio-button>
         <el-radio-button value="">{{ t('payAll') }}</el-radio-button>
       </el-radio-group>
@@ -823,27 +853,25 @@ const PaymentsView = {
     </div>
     <div class="panel" v-loading="loading">
       <el-table v-if="rows.length" :data="rows" style="width:100%" :row-class-name="({ row }) => payOverdue(row, today) ? 'row-overdue' : ''">
-        <el-table-column :label="t('payContract')" min-width="190">
+        <el-table-column :label="t('payContract')" min-width="160">
           <template #default="{ row }"><a href="javascript:void 0" @click="go('detail', row.contract_id, { tab: 'payments' })">{{ contractLabel(row) }}</a>
             <div class="muted small">{{ row.party_b }}</div></template></el-table-column>
-        <el-table-column :label="t('paySeq')" width="56" prop="seq" />
-        <el-table-column :label="t('payCondition')" min-width="200"><template #default="{ row }">{{ payLabel(row) }}<div class="muted small" v-if="row.due_rule">{{ row.due_rule }}</div></template></el-table-column>
-        <el-table-column :label="t('payPlanned')" width="140" align="right"><template #default="{ row }"><span class="num">{{ fmt(row.amount, row.currency) }}</span></template></el-table-column>
+        <el-table-column :label="t('payCondition')" min-width="180"><template #default="{ row }"><span class="muted">#{{ row.seq }}</span> {{ payLabel(row) }}<div class="muted small" v-if="row.due_rule">{{ row.due_rule }}</div></template></el-table-column>
+        <el-table-column :label="t('payPlanned')" width="150" align="right"><template #default="{ row }"><span v-if="row.amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.amount) }}</span></span></template></el-table-column>
         <el-table-column :label="t('payDue')" width="110"><template #default="{ row }"><span :class="{ danger: payOverdue(row, today) }">{{ row.due_date || '—' }}</span></template></el-table-column>
         <el-table-column :label="t('payStatus')" width="100">
           <template #default="{ row }">
-            <el-tag v-if="row.status === 'paid'" type="success" size="small">{{ t('ps_paid') }}</el-tag>
-            <el-tag v-else-if="payOverdue(row, today)" type="danger" size="small">{{ t('payOverdue') }}</el-tag>
-            <el-tag v-else type="info" size="small">{{ t('ps_pending') }}</el-tag></template></el-table-column>
-        <el-table-column :label="t('payPaid')" width="150"><template #default="{ row }"><template v-if="row.status === 'paid'"><div class="num">{{ fmt(row.paid_amount, row.currency) }}</div><div class="muted small">{{ row.paid_date }}</div></template></template></el-table-column>
-        <el-table-column :label="t('payProof')" width="70" align="center"><template #default="{ row }"><span v-if="row.files"><el-icon><Paperclip /></el-icon>{{ row.files }}</span></template></el-table-column>
-        <el-table-column v-if="can('payment.record')" width="80" align="right">
+            <el-tag :type="PAY_TAG[payState(row, today)]" size="small">{{ t('ps_' + payState(row, today)) }}</el-tag></template></el-table-column>
+        <el-table-column :label="t('payPaid')" width="150"><template #default="{ row }"><template v-if="row.status === 'paid'"><div><span v-if="row.paid_amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.paid_amount) }}</span></span><span v-if="row.paid_amount == null">—</span></div><div class="muted small">{{ row.paid_date || '—' }}</div></template></template></el-table-column>
+        <el-table-column :label="t('payProofShort')" width="60" align="center"><template #default="{ row }"><span v-if="row.files"><el-icon><Paperclip /></el-icon>{{ row.files }}</span></template></el-table-column>
+        <el-table-column v-if="can('payment.record')" width="76" align="center" :fixed="vw >= 640 ? 'right' : false">
           <template #default="{ row }"><el-button size="small" :type="row.status === 'paid' ? '' : 'primary'" plain @click="open(row)">{{ t('payRecord') }}</el-button></template></el-table-column>
       </el-table>
       <el-empty v-else-if="!loading" :description="t('payNoneFound')" />
     </div>
     <div class="pager" v-if="total > 0">
-      <el-pagination background :current-page="page" :page-size="pageSize" :total="total" layout="total, prev, pager, next" @current-change="onPage" />
+      <el-pagination background :current-page="page" :page-size="pageSize" :total="total" layout="total, prev, pager, next"
+        :pager-count="vw < 640 ? 5 : 7" :size="vw < 640 ? 'small' : 'default'" @current-change="onPage" />
     </div>
     <PaymentDialog v-model="dlg" :payment="current" :contract-id="current && current.contract_id" :currency="current && current.currency" @saved="load" />
   </div>`,
@@ -880,13 +908,24 @@ const DetailView = {
     let timer = null;
     const pdfRef = ref(null);
     watch(showPdf, v => { try { localStorage.setItem('cms_pdf', v ? '1' : '0'); } catch (e) {} });
+    function scrollTextTo(p) {  // Word / text contracts: show the cited part of the extracted text
+      nextTick(() => {
+        const box = pdfRef.value && pdfRef.value.querySelector('.text-preview');
+        const el = box && box.querySelector('#tp-' + p);
+        if (el) box.scrollTo({ top: el.offsetTop - box.offsetTop - 8, behavior: 'smooth' });  // scroll the panel only
+      });
+    }
     function openPage(p) {
       showPdf.value = true; pdfPage.value = p; pdfKey.value++;
       if (window.innerWidth < 1100) nextTick(() => pdfRef.value && pdfRef.value.scrollIntoView({ behavior: 'smooth' }));
+      if (!isPdf.value) { if (!pages.value.length) loadPages().then(() => scrollTextTo(p)); else scrollTextTo(p); }
     }
     provide('openPage', openPage);
     async function load() {
       try { c.value = await api('/api/contracts/' + props.id); } catch (e) { ElMessage.error(e.message); return; }
+      if (!isPdf.value && !pages.value.length && !WORKING.includes(c.value.status)) {
+        loadPages().then(() => { if (query.p) scrollTextTo(Number(query.p)); }).catch(() => {});
+      }
       clearTimeout(timer);
       if (WORKING.includes(c.value.status)) timer = setTimeout(load, 3000);
     }
@@ -1097,6 +1136,7 @@ const DetailView = {
       :title="t('processingNow') + '：' + t('s_' + c.status) + (c.progress ? ' — ' + c.progress : '')" />
     <el-alert v-if="c.status === 'failed'" type="error" :closable="false" show-icon class="mb" :title="t('failedTitle')" :description="c.error" />
     <el-alert v-if="c.status === 'review' && !editing && (can('contract.review') || can('contract.edit'))" type="warning" :closable="false" show-icon class="mb" :title="t('reviewTip')" />
+    <el-alert v-if="editing && c.status === 'confirmed'" type="warning" :closable="false" show-icon class="mb" :title="t('reReviewTip')" />
 
     <div class="detail" :class="{ nopdf: !showPdf }">
       <div class="detail-main">
@@ -1144,6 +1184,7 @@ const DetailView = {
                 <h2>{{ t('notes') }}</h2>
                 <el-input :model-value="c.notes" @change="v => setMeta('notes', v)" @update:model-value="v => c.notes = v"
                   type="textarea" :autosize="{minRows:2}" :placeholder="t('notesPh')" :disabled="!can('contract.edit')" />
+                <div class="muted small mt-xs" v-if="c.status === 'confirmed'">{{ t('notesNoReReview') }}</div>
               </div>
             </template>
           </el-tab-pane>
@@ -1151,9 +1192,9 @@ const DetailView = {
           <el-tab-pane :label="t('tabAmounts')" name="amounts">
             <template v-if="d">
               <div v-if="recon" class="recon" :class="recon.ok ? 'match' : 'mismatch'">
-                <div><div class="k">{{ t('itemsSum') }} ({{ (d.line_items || []).length }})</div><div class="v">{{ fmt(recon.sum, cur) }}</div></div>
-                <div><div class="k">{{ t('contractTotal') }}</div><div class="v">{{ fmt(recon.total, cur) }}</div></div>
-                <div class="diff"><div class="k">{{ recon.ok ? t('matched') : t('unmatched') }}</div><div class="v">{{ recon.ok ? '✓' : fmt(recon.diff, cur) }}</div></div>
+                <div><div class="k">{{ t('itemsSum') }} ({{ (d.line_items || []).length }})</div><div class="v"><span class="cur">{{ cur }}</span> <span class="amt">{{ fmt(recon.sum) }}</span></div></div>
+                <div><div class="k">{{ t('contractTotal') }}</div><div class="v"><span class="cur">{{ cur }}</span> <span class="amt">{{ fmt(recon.total) }}</span></div></div>
+                <div class="diff"><div class="k">{{ recon.ok ? t('matched') : t('unmatched') }}</div><div class="v"><template v-if="recon.ok">✓</template><template v-else><span class="cur">{{ cur }}</span> <span class="amt">{{ fmt(recon.diff) }}</span></template></div></div>
               </div>
               <div class="card">
                 <h2>{{ t('totalAmount') }} <PageRef :p="d.amount && d.amount.page" /></h2>
@@ -1235,10 +1276,18 @@ const DetailView = {
       </div>
 
       <div class="pdf" v-show="showPdf" ref="pdfRef">
-        <div class="pdf-bar"><span>{{ t('pdfTitle') }} · p.{{ pdfPage }}</span>
+        <div class="pdf-bar"><span>{{ isPdf ? t('pdfTitle') : t('textTitle') }} · p.{{ pdfPage }}</span>
           <el-button link size="small" @click="showPdf = false"><el-icon><Close /></el-icon></el-button></div>
         <iframe v-if="isPdf" :key="pdfKey" :src="'/api/contracts/' + c.id + '/file#page=' + pdfPage + '&view=FitH'" title="PDF"></iframe>
-        <el-empty v-else :description="t('noPreview')" />
+        <div v-else class="text-preview">
+          <div class="tp-note muted small">{{ t('textPreviewNote') }}
+            <a v-if="can('contract.download')" :href="'/api/contracts/' + c.id + '/file?download=1'">{{ t('downloadOriginal') }}</a></div>
+          <div v-for="p in pages" :key="p.page_no" :id="'tp-' + p.page_no" class="tp-page" :class="{ 'tp-hit': p.page_no === pdfPage }">
+            <div v-if="pages.length > 1" class="page-head"><span class="pg">p.{{ p.page_no }}</span></div>
+            <div class="page-text" v-html="hl(p.redacted_text)"></div>
+          </div>
+          <el-empty v-if="!pages.length" :description="WORKING.includes(c.status) ? t('processingNow') : t('noText')" />
+        </div>
       </div>
     </div>
     <el-dialog v-model="deptDlg" :title="t('changeDept')" width="460px">
@@ -1260,17 +1309,22 @@ const AuditView = {
     async function load() {
       loading.value = true;
       const p = { user_q: f.user_q, action: f.action, limit: size, offset: (page.value - 1) * size };
-      if (f.range && f.range.length === 2) { p.date_from = f.range[0]; p.date_to = f.range[1]; }
+      if (f.range && f.range[0]) p.date_from = f.range[0];
+      if (f.range && f.range[1]) p.date_to = f.range[1];
       try { const r = await api('/api/audit?' + new URLSearchParams(p).toString()); rows.value = r.rows; total.value = r.total; }
       catch (e) { ElMessage.error(e.message); }
       loading.value = false;
     }
     let debounce = null;
     watch(() => [f.action, f.range], () => { page.value = 1; load(); });
+    function setRange(i, v) {  // phone layout: "from" and "to" are picked separately; either one alone also filters
+      const r = [...(f.range || [null, null])]; r[i] = v || null;
+      f.range = r[0] || r[1] ? (r[0] && r[1] && r[0] > r[1] ? [r[1], r[0]] : r) : null;
+    }
     watch(() => f.user_q, () => { clearTimeout(debounce); debounce = setTimeout(() => { page.value = 1; load(); }, 300); });
     watch(page, load);
     onMounted(load);
-    return { rows, total, loading, page, size, f, ACTIONS, go };
+    return { rows, total, loading, page, size, f, ACTIONS, go, setRange };
   },
   template: `
   <div>
@@ -1279,7 +1333,11 @@ const AuditView = {
       <el-input v-model="f.user_q" :placeholder="t('user')" clearable style="width:180px"><template #prefix><el-icon><User /></el-icon></template></el-input>
       <el-select v-model="f.action" :placeholder="t('allActions')" clearable style="width:180px">
         <el-option v-for="a in ACTIONS" :key="a" :value="a" :label="t('a_' + a)" /></el-select>
-      <el-date-picker v-model="f.range" type="daterange" value-format="YYYY-MM-DD" :start-placeholder="t('dateRange')" :end-placeholder="t('dateRange')" style="width:280px" />
+      <el-date-picker v-if="vw >= 640" v-model="f.range" type="daterange" value-format="YYYY-MM-DD" :start-placeholder="t('dateFrom')" :end-placeholder="t('dateTo')" style="width:280px" />
+      <div v-else class="date-pair">
+        <el-date-picker :model-value="(f.range || [])[0]" @update:model-value="v => setRange(0, v)" type="date" value-format="YYYY-MM-DD" :placeholder="t('dateFrom')" />
+        <el-date-picker :model-value="(f.range || [])[1]" @update:model-value="v => setRange(1, v)" type="date" value-format="YYYY-MM-DD" :placeholder="t('dateTo')" />
+      </div>
     </div>
     <div class="panel" v-loading="loading">
       <el-table :data="rows" style="width:100%" :empty-text="t('noHistory')">
@@ -1489,7 +1547,7 @@ const UsersView = {
             <el-table-column :label="t('seeAll')" width="160"><template #default="{ row }">
               <el-switch :model-value="!!row.see_all" @change="v => toggleSeeAll(row, v)" /></template></el-table-column>
             <el-table-column :label="t('members')" width="90" align="right"><template #default="{ row }">{{ row.users }}</template></el-table-column>
-            <el-table-column :label="t('contracts')" width="90" align="right"><template #default="{ row }">{{ row.contracts }}</template></el-table-column>
+            <el-table-column :label="t('contractCount')" width="90" align="right"><template #default="{ row }">{{ row.contracts }}</template></el-table-column>
             <el-table-column width="140" align="right"><template #default="{ row }">
               <el-button link type="primary" @click="editDept(row)">{{ t('edit') }}</el-button>
               <el-button link type="danger" @click="deleteDept(row)">{{ t('remove') }}</el-button></template></el-table-column>
@@ -1614,7 +1672,9 @@ const AIView = {
     async function searchContracts(q) {
       try { scopeOptions.value = (await api('/api/contracts?q=' + encodeURIComponent(q || ''))).slice(0, 30); } catch (e) {}
     }
-    function newChat() { go('ai'); conv.value = null; messages.value = []; scopePick.value = []; input.value = ''; }
+    function newChat() { go('ai'); conv.value = null; messages.value = []; scopePick.value = []; input.value = ''; sideOpen.value = false; }
+    const sideOpen = ref(false);  // narrow screens: the conversation list slides in over the chat
+    watch(() => props.id, () => { sideOpen.value = false; });
 
     async function send(text) {
       const q = (text || input.value).trim();
@@ -1686,18 +1746,19 @@ const AIView = {
     }
     function onConvCmd(c, cmd) { if (cmd === 'rename') rename(c); if (cmd === 'delete') remove(c); }
     const examples = computed(() => [t('ex1'), t('ex2'), t('ex3'), t('ex4')]);
-    return { convs, search, conv, messages, input, busy, usage, scopePick, scopeOptions, scroller, groups, newChat, send, stop,
+    return { sideOpen, convs, search, conv, messages, input, busy, usage, scopePick, scopeOptions, scroller, groups, newChat, send, stop,
       onKey, onAnswerClick, copy, onConvCmd, searchContracts, examples, renderAnswer, stepText, go, store };
   },
   template: `
   <div class="ai">
-    <aside class="ai-side">
+    <div v-if="sideOpen" class="ai-backdrop" @click="sideOpen = false"></div>
+    <aside class="ai-side" :class="{ open: sideOpen }">
       <el-button type="primary" class="w100" @click="newChat"><el-icon><Plus /></el-icon>{{ t('newChat') }}</el-button>
       <el-input v-model="search" :placeholder="t('searchChats')" clearable class="mt-s"><template #prefix><el-icon><Search /></el-icon></template></el-input>
       <div class="conv-list">
         <template v-for="g in groups" :key="g.key">
           <div class="conv-group">{{ t(g.key) }}</div>
-          <div v-for="c in g.items" :key="c.id" class="conv" :class="{ on: conv && conv.id === c.id }" @click="go('ai', c.id)">
+          <div v-for="c in g.items" :key="c.id" class="conv" :class="{ on: conv && conv.id === c.id }" @click="sideOpen = false; go('ai', c.id)">
             <span class="conv-title">{{ c.title }}</span>
             <el-icon v-if="c.scope" class="conv-scope" :title="c.scope.map(s => s.label).join(', ')"><Paperclip /></el-icon>
             <el-dropdown trigger="click" @command="cmd => onConvCmd(c, cmd)" @click.stop>
@@ -1717,6 +1778,10 @@ const AIView = {
 
     <section class="ai-main">
       <div class="ai-head">
+        <div class="ai-narrow-tools">
+          <el-button size="small" @click="sideOpen = true" :title="t('chatHistory')"><el-icon><Expand /></el-icon><span>{{ t('chatHistory') }}</span></el-button>
+          <el-button size="small" type="primary" plain @click="newChat" :title="t('newChat')"><el-icon><Plus /></el-icon></el-button>
+        </div>
         <div class="ai-title">{{ conv ? conv.title : t('aiTitle') }}</div>
         <div class="ai-scope">
           <template v-if="conv && conv.scope"><el-icon><Paperclip /></el-icon>
@@ -1918,7 +1983,7 @@ const Root = {
   <el-config-provider :locale="epLocale">
     <template v-if="store.authChecked">
       <AuthView v-if="!store.user" />
-      <div v-else class="shell">
+      <div v-else class="shell" :class="{ 'shell-ai': store.route.name === 'ai' }">
         <aside class="nav">
           <div class="brand"><div class="brand-mark" aria-hidden="true"></div>
             <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>

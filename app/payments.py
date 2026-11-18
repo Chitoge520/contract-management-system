@@ -39,8 +39,10 @@ def _files_for(ids):
 def for_contract(cid):
     rows = db.q("SELECT * FROM payments WHERE contract_id=? ORDER BY seq, id", (cid,))
     files = _files_for([r["id"] for r in rows])
+    day = today()
     for r in rows:
         r["files"] = files[r["id"]]
+        r["state"] = state(r, day)
     return rows
 
 
@@ -48,15 +50,39 @@ def summary(cid):
     return summaries([cid]).get(cid)
 
 
+def paid_sql(a="payments"):
+    """A node counts as paid only with a complete record: amount paid > 0, payment date and currency."""
+    return (f"({a}.status='paid' AND {a}.paid_amount>0 AND coalesce({a}.paid_date,'')<>'' "
+            f"AND coalesce({a}.currency,'')<>'')")
+
+
+def is_paid(p):
+    return p.get("status") == "paid" and (p.get("paid_amount") or 0) > 0 and bool(p.get("paid_date")) \
+        and bool(p.get("currency"))
+
+
+def state(p, day=None):
+    """paid / incomplete (marked paid, details missing) / overdue / pending"""
+    if is_paid(p):
+        return "paid"
+    if p.get("status") == "paid":
+        return "incomplete"
+    if p.get("due_date") and p["due_date"] < (day or today()):
+        return "overdue"
+    return "pending"
+
+
 def summaries(cids):
-    """{contract_id: {"total", "paid", "overdue"}} for the ledger's progress column."""
+    """{contract_id: {"total", "paid", "incomplete", "overdue"}} for the ledger's progress column."""
     if not cids:
         return {}
     marks = ",".join("?" * len(cids))
-    rows = db.q(f"SELECT contract_id, count(*) total, sum(status='paid') paid, "
-                f"sum(status<>'paid' AND due_date IS NOT NULL AND due_date<?) overdue "
+    ok = paid_sql()
+    rows = db.q(f"SELECT contract_id, count(*) total, sum({ok}) paid, sum(status='paid' AND NOT {ok}) incomplete, "
+                f"sum(NOT {ok} AND status<>'paid' AND due_date IS NOT NULL AND due_date<?) overdue "
                 f"FROM payments WHERE contract_id IN ({marks}) GROUP BY contract_id", [today()] + list(cids))
-    return {r["contract_id"]: {"total": r["total"], "paid": r["paid"] or 0, "overdue": r["overdue"] or 0} for r in rows}
+    return {r["contract_id"]: {"total": r["total"], "paid": r["paid"] or 0, "incomplete": r["incomplete"] or 0,
+                               "overdue": r["overdue"] or 0} for r in rows}
 
 
 def get(pid):
@@ -162,8 +188,31 @@ def _clean(body):
     return out
 
 
+def _check_paid(p):
+    """A payment marked as paid needs the amount paid (> 0), the payment date (not in the future) and the currency."""
+    if p.get("status") != "paid":
+        return
+    missing = []
+    if p.get("paid_amount") is None:
+        missing.append("实付金额 amount paid")
+    if not p.get("paid_date"):
+        missing.append("付款日期 payment date")
+    if not p.get("currency"):
+        missing.append("币种 currency")
+    if missing:
+        raise HTTPException(400, "登记为已付款需要填写：" + "、".join(m.split(" ")[0] for m in missing)
+                            + " / To mark as paid, fill in: " + ", ".join(m.split(" ", 1)[1] for m in missing))
+    if p["paid_amount"] <= 0:
+        raise HTTPException(400, "实付金额必须大于 0 / Amount paid must be greater than 0")
+    if p["paid_date"] > today():
+        raise HTTPException(400, "付款日期不能晚于今天 / Payment date cannot be in the future")
+
+
 def create(cid, body, user_name):
     vals = _clean(body)
+    if not vals.get("currency"):
+        vals["currency"] = (db.q("SELECT currency FROM contracts WHERE id=?", (cid,), one=True) or {}).get("currency")
+    _check_paid(vals)
     if vals.get("seq") is None:
         vals["seq"] = (db.q("SELECT max(seq) n FROM payments WHERE contract_id=?", (cid,), one=True)["n"] or 0) + 1
     vals.setdefault("status", "pending")
@@ -184,6 +233,7 @@ def update(pid, body, user_name):
         return p, {}
     if vals.get("status") == "pending" and p["status"] == "paid":
         vals.update(paid_amount=None, paid_date=None)  # marked as not paid any more
+    _check_paid({**p, **vals})
     vals.update(recorded_by=user_name, recorded_at=db.now())
     db.ex(f"UPDATE payments SET {', '.join(k + '=?' for k in vals)} WHERE id=?", list(vals.values()) + [pid])
     return get(pid), changes
@@ -241,10 +291,13 @@ def media_type(stored_name):
     return PROOF_TYPES.get(Path(stored_name).suffix.lower())
 
 
+STATE_TEXT = {"paid": "已付款 Paid", "incomplete": "待补全 Incomplete", "overdue": "已逾期 Overdue", "pending": "未付款 Pending"}
+
+
 def export_rows(cid):
     """Rows for the Excel export (payments sheet)."""
     rows = for_contract(cid)
     return [[p["seq"], p["trigger_en"], p["trigger_zh"], p["percentage"], p["amount"], p["currency"], p["due_rule"],
-             p["due_date"], "已付款 Paid" if p["status"] == "paid" else "未付款 Pending", p["paid_amount"], p["paid_date"],
+             p["due_date"], STATE_TEXT[p["state"]], p["paid_amount"], p["paid_date"],
              p["note"], p["recorded_by"], len(p["files"]), p["page"]] for p in rows]
 

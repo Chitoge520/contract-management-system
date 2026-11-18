@@ -51,9 +51,15 @@ def _require_idle(row):
         raise HTTPException(409, "合同正在处理中，请等处理完成后再操作 / This contract is being processed, try again when it is done")
 
 
+_PATH_RE = re.compile(r"(?:[A-Za-z]:\\|/)[^\s'\"]+")
+
+
 def _list_row(r):
     r = dict(r)
     r.pop("data_json", None)
+    r.pop("search_text", None)
+    if r.get("error"):  # errors saved by older versions could contain server file paths
+        r["error"] = _PATH_RE.sub("…", r["error"])
     return r
 
 
@@ -611,13 +617,19 @@ def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "
 
 @app.post("/api/contracts")
 async def upload(files: List[UploadFile] = File(...), user=Depends(require("contract.upload"))):
+    from .extract_text import UnreadableFile, check_readable
     created, duplicates, rejected = [], [], []
     for f in files:
         ext = Path(f.filename).suffix.lower()
         if ext not in ALLOWED:
-            rejected.append(f.filename)
+            rejected.append({"file": f.filename, "reason": "只支持 PDF、Word（.docx）和 TXT 文件 / Only PDF, Word (.docx) and TXT files"})
             continue
         content = await f.read()
+        try:
+            check_readable(ext, content)  # damaged files are refused here, before they reach the ledger
+        except UnreadableFile as e:
+            rejected.append({"file": f.filename, "reason": str(e)})
+            continue
         h = hashlib.sha256(content).hexdigest()
         dup = db.q("SELECT id, file_name FROM contracts WHERE file_hash=?", (h,), one=True)
         if dup:
@@ -836,15 +848,19 @@ def payment_tracking(status: str = "", q: str = "", year: str = "", page: int = 
     where, args = _contract_filter(user, year=year)
     sql = f"FROM payments p JOIN contracts ON contracts.id=p.contract_id WHERE {where}"
     today = payments.today()
+    ok = payments.paid_sql("p")
     if status == "paid":
-        sql += " AND p.status='paid'"
-    elif status == "pending":
-        sql += " AND p.status<>'paid'"
+        sql += f" AND {ok}"
+    elif status == "pending":            # everything not fully paid, including records that need completing
+        sql += f" AND NOT {ok}"
+    elif status == "incomplete":
+        sql += f" AND p.status='paid' AND NOT {ok}"
     elif status == "overdue":
-        sql += " AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date<?"
+        sql += f" AND NOT {ok} AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date<?"
         args.append(today)
     elif status == "due30":
-        sql += " AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date>=? AND p.due_date<=date(?, '+30 days')"
+        sql += (f" AND NOT {ok} AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date>=? "
+                "AND p.due_date<=date(?, '+30 days')")
         args += [today, today]
     for word in q.split():
         like = f"%{word.lower()}%"
@@ -855,8 +871,10 @@ def payment_tracking(status: str = "", q: str = "", year: str = "", page: int = 
     page_size, page = min(max(page_size, 1), 200), max(page, 1)
     rows = db.q("SELECT p.*, contracts.contract_no, contracts.title, contracts.title_zh, contracts.party_b, "
                 "(SELECT count(*) FROM payment_files f WHERE f.payment_id=p.id) files " + sql +
-                " ORDER BY (p.status='paid'), p.due_date IS NULL, p.due_date, contracts.id DESC, p.seq LIMIT ? OFFSET ?",
+                f" ORDER BY {ok}, p.due_date IS NULL, p.due_date, contracts.id DESC, p.seq LIMIT ? OFFSET ?",
                 args + [page_size, (page - 1) * page_size])
+    for r in rows:
+        r["state"] = payments.state(r, today)
     return {"total": total, "page": page, "page_size": page_size, "rows": rows, "today": today}
 
 
