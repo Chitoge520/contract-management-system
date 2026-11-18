@@ -17,10 +17,6 @@ def enqueue(cid, stage="read"):
     _q.put((cid, stage))
 
 
-def _exists(cid):
-    return bool(db.q("SELECT 1 FROM contracts WHERE id=?", (cid,), one=True))
-
-
 def _process(cid, stage):
     row = db.q("SELECT * FROM contracts WHERE id=?", (cid,), one=True)
     if not row:
@@ -29,24 +25,20 @@ def _process(cid, stage):
         db.set_status(cid, "reading", "读取文本 / Reading")
         path = db.FILES_DIR / row["stored_name"]
         pages = read_any(str(path), on_progress=lambda p: db.set_status(cid, "reading", p))
-        masked_pages = [(page_no, text, *redact_text(text), is_ocr) for page_no, text, is_ocr in pages]
-        with db._lock:  # check and write together, so a contract deleted meanwhile gets no orphan rows
-            if not _exists(cid):
-                return
-            db.ex("DELETE FROM pages WHERE contract_id=?", (cid,))
-            for page_no, text, masked, _n, is_ocr in masked_pages:
-                db.ex("INSERT INTO pages (contract_id, page_no, text, redacted_text, is_ocr) VALUES (?,?,?,?,?)",
-                      (cid, page_no, text, masked, 1 if is_ocr else 0))
-            db.ex("UPDATE contracts SET page_count=?, ocr_pages=?, redaction_count=? WHERE id=?",
-                  (len(pages), sum(1 for p in pages if p[2]), sum(p[3] for p in masked_pages), cid))
+        total_masked = 0
+        db.ex("DELETE FROM pages WHERE contract_id=?", (cid,))
+        for page_no, text, is_ocr in pages:
+            masked, n = redact_text(text)
+            total_masked += n
+            db.ex("INSERT INTO pages (contract_id, page_no, text, redacted_text, is_ocr) VALUES (?,?,?,?,?)",
+                  (cid, page_no, text, masked, 1 if is_ocr else 0))
+        db.ex("UPDATE contracts SET page_count=?, ocr_pages=?, redaction_count=? WHERE id=?",
+              (len(pages), sum(1 for p in pages if p[2]), total_masked, cid))
     db.set_status(cid, "extracting", "AI 分析中 / AI extracting")
     pages = db.q("SELECT page_no, redacted_text FROM pages WHERE contract_id=? ORDER BY page_no", (cid,))
     data, model = extract_contract([(p["page_no"], p["redacted_text"]) for p in pages])
-    with db._lock:
-        if not _exists(cid):
-            return
-        db.save_data(cid, data, model)
-        db.set_status(cid, "review", None)
+    db.save_data(cid, data, model)
+    db.set_status(cid, "review", None)
     from . import auth
     auth.log(None, "extracted", cid, {"model": model, "items": len(data.get("line_items") or [])})
 
