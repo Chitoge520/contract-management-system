@@ -12,63 +12,7 @@ DB_PATH = DATA_DIR / "contracts.db"
 
 _lock = threading.RLock()
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS contracts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_name TEXT NOT NULL,
-    stored_name TEXT NOT NULL,
-    file_hash TEXT,
-    uploaded_at TEXT,
-    updated_at TEXT,
-    status TEXT DEFAULT 'queued',      -- queued / reading / extracting / review / confirmed / failed
-    progress TEXT,
-    error TEXT,
-    page_count INTEGER DEFAULT 0,
-    ocr_pages INTEGER DEFAULT 0,
-    redaction_count INTEGER DEFAULT 0,
-    contract_type TEXT,
-    contract_no TEXT,
-    title TEXT,
-    title_zh TEXT,
-    party_a TEXT,
-    party_b TEXT,
-    signing_date TEXT,
-    effective_date TEXT,
-    start_date TEXT,
-    end_date TEXT,
-    currency TEXT,
-    total_amount REAL,
-    lifecycle_status TEXT DEFAULT 'active', -- draft / active / completed / terminated
-    notes TEXT,
-    data_json TEXT,
-    llm_model TEXT,
-    confirmed_at TEXT
-);
-CREATE TABLE IF NOT EXISTS pages (
-    contract_id INTEGER,
-    page_no INTEGER,
-    text TEXT,
-    redacted_text TEXT,
-    is_ocr INTEGER DEFAULT 0,
-    PRIMARY KEY (contract_id, page_no)
-);
-CREATE TABLE IF NOT EXISTS line_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    contract_id INTEGER,
-    seq INTEGER,
-    category TEXT,
-    name TEXT,
-    name_zh TEXT,
-    description TEXT,
-    quantity REAL,
-    unit TEXT,
-    unit_price REAL,
-    amount REAL,
-    currency TEXT,
-    page INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_items_contract ON line_items(contract_id);
-"""
+# Table definitions and upgrades: see schema.py
 
 SCALAR_FIELDS = [
     "contract_type", "contract_no", "title", "title_zh", "party_a", "party_b",
@@ -89,10 +33,51 @@ def connect():
 
 
 def init():
-    DATA_DIR.mkdir(exist_ok=True)
-    FILES_DIR.mkdir(exist_ok=True)
+    """Create the database or upgrade it to the current structure (see schema.py)."""
+    from . import schema
+    schema.run()
+
+
+def _values(obj, out):
+    """Every text / number inside the extraction JSON, without the field names."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _values(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _values(v, out)
+    elif isinstance(obj, bool) or obj is None:
+        pass
+    elif isinstance(obj, float) and obj.is_integer():
+        out.append(str(int(obj)))
+    else:
+        out.append(str(obj))
+    return out
+
+
+def search_text_for(row):
+    """What the contract list and the AI assistant search in: file name, number, titles, parties, notes and the
+    content of the AI extraction (not its JSON field names). Lower-cased; queries are lower-cased the same way."""
+    parts = [row.get(k) for k in ("file_name", "contract_no", "title", "title_zh", "party_a", "party_b", "notes")]
+    try:
+        data = json.loads(row["data_json"]) if row.get("data_json") else None
+    except (TypeError, ValueError):
+        data = None
+    parts += _values(data, []) if data is not None else []
+    return "\n".join(str(p) for p in parts if p not in (None, "")).lower()
+
+
+def refresh_search(cid, conn=None):
+    """Recompute the search column of one contract (after its data, notes or file name changed)."""
+    def work(c):
+        r = c.execute("SELECT * FROM contracts WHERE id=?", (cid,)).fetchone()
+        if r:
+            c.execute("UPDATE contracts SET search_text=? WHERE id=?", (search_text_for(dict(r)), cid))
+    if conn is not None:
+        return work(conn)
     with _lock, connect() as c:
-        c.executescript(SCHEMA)
+        work(c)
+        c.commit()
 
 
 def q(sql, args=(), one=False):
@@ -164,13 +149,10 @@ def save_data(cid, data, model=None):
                 (cid, i + 1, it.get("category"), it.get("name"), it.get("name_zh"), it.get("description"),
                  to_float(it.get("quantity")), it.get("unit"), to_float(it.get("unit_price")),
                  to_float(it.get("amount")), it.get("currency") or vals["currency"], it.get("page")))
+        refresh_search(cid, c)
         c.commit()
 
 
 def delete_contract(cid):
-    with _lock, connect() as c:
-        c.execute("DELETE FROM line_items WHERE contract_id=?", (cid,))
-        c.execute("DELETE FROM pages WHERE contract_id=?", (cid,))
-        c.execute("DELETE FROM contract_departments WHERE contract_id=?", (cid,))
-        c.execute("DELETE FROM contracts WHERE id=?", (cid,))
-        c.commit()
+    """Pages, line items and department links go with it (foreign keys, see schema.py)."""
+    ex("DELETE FROM contracts WHERE id=?", (cid,))

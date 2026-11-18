@@ -10,38 +10,6 @@ from fastapi import HTTPException
 
 from . import db
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS departments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    see_all INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS contract_departments (
-    contract_id INTEGER NOT NULL,
-    department_id INTEGER NOT NULL,
-    PRIMARY KEY (contract_id, department_id)
-);
-CREATE INDEX IF NOT EXISTS idx_cd_dept ON contract_departments(department_id);
-"""
-
-
-def init():
-    with db._lock, db.connect() as c:
-        c.executescript(SCHEMA)
-        cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
-        if "department_id" not in cols:
-            c.execute("ALTER TABLE users ADD COLUMN department_id INTEGER")
-        if "position" not in cols:
-            c.execute("ALTER TABLE users ADD COLUMN position TEXT")
-        for col in ("ai_daily_questions", "ai_daily_tokens"):  # per-user AI quota overrides (NULL = default)
-            if col not in cols:
-                c.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER")
-        # links left behind by contracts deleted before delete_contract cleaned them up
-        c.execute("DELETE FROM contract_departments WHERE contract_id NOT IN (SELECT id FROM contracts)")
-        c.commit()
-
-
 def department(dept_id):
     if not dept_id:
         return None

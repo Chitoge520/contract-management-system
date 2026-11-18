@@ -14,46 +14,6 @@ MAX_TOOL_ROUNDS = 8
 HISTORY_MESSAGES = 12
 TOOL_RESULT_CHARS = 14000
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    title TEXT,
-    scope TEXT,                 -- JSON list of contract ids, NULL = all contracts the user may see
-    created_at TEXT,
-    updated_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id, updated_at);
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id INTEGER NOT NULL,
-    role TEXT NOT NULL,         -- user / assistant
-    content TEXT,
-    steps TEXT,                 -- JSON: tools the assistant used
-    citations TEXT,             -- JSON: contracts cited
-    tokens_in INTEGER DEFAULT 0,
-    tokens_out INTEGER DEFAULT 0,
-    model TEXT,
-    status TEXT DEFAULT 'done', -- done / stopped / error
-    created_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, id);
-CREATE TABLE IF NOT EXISTS ai_usage (
-    user_id INTEGER NOT NULL,
-    day TEXT NOT NULL,
-    questions INTEGER DEFAULT 0,
-    tokens INTEGER DEFAULT 0,
-    PRIMARY KEY (user_id, day)
-);
-"""
-
-
-def init():
-    with db._lock, db.connect() as c:
-        c.executescript(SCHEMA)
-        c.commit()
-
-
 def today():
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -187,8 +147,7 @@ def tool_search_contracts(ids, query="", contract_type=None, party=None, year=No
     sql = f"SELECT * FROM contracts WHERE id IN {marks}"
     for w in (query or "").split():
         like = f"%{w.lower()}%"
-        sql += (" AND (lower(coalesce(contract_no,'')||' '||coalesce(title,'')||' '||coalesce(title_zh,'')||' '||"
-                "coalesce(party_a,'')||' '||coalesce(party_b,'')||' '||coalesce(data_json,'')) LIKE ?"
+        sql += (" AND (coalesce(search_text,'') LIKE ?"
                 " OR id IN (SELECT contract_id FROM pages WHERE lower(redacted_text) LIKE ?))")
         args += [like, like]
     if contract_type:

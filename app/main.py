@@ -30,10 +30,8 @@ ai_user = require("ai.use")
 
 @app.on_event("startup")
 def _startup():
-    db.init()
-    auth.init()
-    access.init()
-    agent.init()
+    db.init()      # creates or upgrades the database (schema.py)
+    auth.init()    # built-in roles
     pipeline.start()
 
 
@@ -555,9 +553,9 @@ def _contract_filter(user, q="", type="", party="", status="", lifecycle="", yea
         args.append(int(dept))
     for word in q.split():
         like = f"%{word.lower()}%"
-        sql += (" AND (lower(coalesce(file_name,'')||' '||coalesce(contract_no,'')||' '||coalesce(title,'')||' '||"
-                "coalesce(title_zh,'')||' '||coalesce(party_a,'')||' '||coalesce(party_b,'')||' '||coalesce(notes,'')||' '||"
-                "coalesce(data_json,'')) LIKE ? OR id IN (SELECT contract_id FROM pages WHERE lower(text) LIKE ?))")
+        # search_text: file name, number, titles, parties, notes and extracted content (see db.search_text_for)
+        sql += (" AND (coalesce(contracts.search_text,'') LIKE ?"
+                " OR contracts.id IN (SELECT contract_id FROM pages WHERE lower(text) LIKE ?))")
         args += [like, like]
     if type:
         sql += " AND contract_type=?"
@@ -627,6 +625,7 @@ async def upload(files: List[UploadFile] = File(...), user=Depends(require("cont
         (db.FILES_DIR / stored).write_bytes(content)
         cid = db.ex("INSERT INTO contracts (file_name, stored_name, file_hash, uploaded_at, updated_at, status, uploaded_by) "
                     "VALUES (?,?,?,?,?, 'queued', ?)", (f.filename, stored, h, db.now(), db.now(), _name(user)))
+        db.refresh_search(cid)
         access.assign_default(cid, user)
         auth.log(user, "upload", cid, {"file": f.filename}, label=f.filename)
         pipeline.enqueue(cid, "read")
@@ -661,6 +660,8 @@ def update_contract(cid: int, body: dict = Body(...), user=Depends(require("cont
     for k in ("lifecycle_status", "notes"):
         if k in body and (body[k] or "") != (row.get(k) or ""):
             db.ex(f"UPDATE contracts SET {k}=?, updated_at=?, updated_by=? WHERE id=?", (body[k], db.now(), _name(user), cid))
+            if k == "notes":
+                db.refresh_search(cid)
             auth.log(user, k, cid, {"old": row.get(k), "new": body[k]})
     return get_contract(cid, user)
 
@@ -899,8 +900,7 @@ def ai_rename_conversation(conv_id: int, body: dict = Body(...), user=Depends(ai
 @app.delete("/api/ai/conversations/{conv_id}")
 def ai_delete_conversation(conv_id: int, user=Depends(ai_user)):
     agent.own_conversation(user, conv_id)
-    db.ex("DELETE FROM messages WHERE conversation_id=?", (conv_id,))
-    db.ex("DELETE FROM conversations WHERE id=?", (conv_id,))
+    db.ex("DELETE FROM conversations WHERE id=?", (conv_id,))  # its messages go with it
     return {"ok": True}
 
 

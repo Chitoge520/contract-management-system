@@ -32,61 +32,9 @@ BUILTIN_ROLES = {
     "viewer": ("只读", ["contract.download", "contract.export", "ai.use", "audit.view"]),
 }
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    display_name TEXT,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'viewer',
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT,
-    last_login TEXT
-);
-CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    created_at TEXT,
-    expires_at TEXT
-);
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT NOT NULL,
-    user_id INTEGER,
-    username TEXT,
-    action TEXT NOT NULL,
-    contract_id INTEGER,
-    contract_label TEXT,
-    detail TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_log(contract_id);
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
-CREATE TABLE IF NOT EXISTS roles (
-    key TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    permissions TEXT NOT NULL DEFAULT '[]',
-    builtin INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT
-);
-"""
-
-
 def init():
+    """Make sure the built-in roles exist (tables: see schema.py)."""
     with db._lock, db.connect() as c:
-        c.executescript(SCHEMA)
-        cols = {r[1] for r in c.execute("PRAGMA table_info(contracts)")}
-        for col in ("uploaded_by", "updated_by", "confirmed_by"):
-            if col not in cols:
-                c.execute(f"ALTER TABLE contracts ADD COLUMN {col} TEXT")
-        ucols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
-        if "status" not in ucols:      # active / pending (self-registered, waiting for an admin)
-            c.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-        if "employee_no" not in ucols:
-            c.execute("ALTER TABLE users ADD COLUMN employee_no TEXT")
-        if "last_seen" not in {r[1] for r in c.execute("PRAGMA table_info(sessions)")}:
-            c.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_no ON users(employee_no COLLATE NOCASE) "
-                  "WHERE employee_no IS NOT NULL")
         for key, (name, perms) in BUILTIN_ROLES.items():
             if not c.execute("SELECT 1 FROM roles WHERE key=?", (key,)).fetchone():
                 c.execute("INSERT INTO roles (key, name, permissions, builtin, created_at) VALUES (?,?,?,1,?)",
