@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import io
+import queue
 import json
 import re
 import sqlite3
@@ -13,7 +15,7 @@ from fastapi import Body, Depends, FastAPI, File, HTTPException, Request, Respon
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import access, auth, db, llm, pipeline
+from . import access, agent, auth, db, llm, pipeline
 from .auth import current_user, require
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -21,6 +23,7 @@ ALLOWED = {".pdf", ".docx", ".txt"}
 
 app = FastAPI(title="Contract Management System")
 admin = require("admin")
+ai_user = require("ai.use")
 
 
 @app.on_event("startup")
@@ -28,6 +31,7 @@ def _startup():
     db.init()
     auth.init()
     access.init()
+    agent.init()
     pipeline.start()
 
 
@@ -698,6 +702,111 @@ def backup(user=Depends(admin)):
         for f in db.FILES_DIR.iterdir():
             z.write(f, f"data/files/{f.name}")
     return FileResponse(zpath, filename=zpath.name, media_type="application/zip")
+
+
+# ================= AI assistant =================
+def _conv_out(c):
+    scope = json.loads(c["scope"]) if c.get("scope") else None
+    return {"id": c["id"], "title": c["title"], "created_at": c["created_at"], "updated_at": c["updated_at"],
+            "scope": agent.scope_label(scope)}
+
+
+@app.get("/api/ai/conversations")
+def ai_conversations(q: str = "", user=Depends(ai_user)):
+    sql, args = "SELECT * FROM conversations WHERE user_id=?", [user["id"]]
+    if q.strip():
+        like = f"%{q.strip().lower()}%"
+        sql += " AND (lower(coalesce(title,'')) LIKE ? OR id IN (SELECT conversation_id FROM messages WHERE lower(content) LIKE ?))"
+        args += [like, like]
+    return [_conv_out(c) for c in db.q(sql + " ORDER BY updated_at DESC LIMIT 300", args)]
+
+
+@app.post("/api/ai/conversations")
+def ai_new_conversation(body: dict = Body(default={}), user=Depends(ai_user)):
+    ids = [int(x) for x in (body or {}).get("contract_ids") or []]
+    for cid in ids:
+        access.require_view(user, cid)
+    cid = db.ex("INSERT INTO conversations (user_id, title, scope, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (user["id"], "新对话", json.dumps(ids) if ids else None, db.now(), db.now()))
+    return _conv_out(db.q("SELECT * FROM conversations WHERE id=?", (cid,), one=True))
+
+
+@app.get("/api/ai/conversations/{conv_id}")
+def ai_get_conversation(conv_id: int, user=Depends(ai_user)):
+    conv = agent.own_conversation(user, conv_id)
+    out = _conv_out(dict(conv, scope=json.dumps(conv["scope"]) if conv["scope"] else None))
+    out["messages"] = agent.message_rows(conv_id)
+    return out
+
+
+@app.put("/api/ai/conversations/{conv_id}")
+def ai_rename_conversation(conv_id: int, body: dict = Body(...), user=Depends(ai_user)):
+    agent.own_conversation(user, conv_id)
+    title = (body.get("title") or "").strip()[:80] or "新对话"
+    db.ex("UPDATE conversations SET title=? WHERE id=?", (title, conv_id))
+    return {"ok": True, "title": title}
+
+
+@app.delete("/api/ai/conversations/{conv_id}")
+def ai_delete_conversation(conv_id: int, user=Depends(ai_user)):
+    agent.own_conversation(user, conv_id)
+    db.ex("DELETE FROM messages WHERE conversation_id=?", (conv_id,))
+    db.ex("DELETE FROM conversations WHERE id=?", (conv_id,))
+    return {"ok": True}
+
+
+@app.post("/api/ai/conversations/{conv_id}/messages")
+async def ai_ask(conv_id: int, request: Request, body: dict = Body(...), user=Depends(ai_user)):
+    conv = agent.own_conversation(user, conv_id)
+    question = (body.get("content") or "").strip()
+    if not question:
+        raise HTTPException(400, "问题不能为空 / Empty question")
+    if len(question) > 4000:
+        raise HTTPException(400, "问题太长（最多 4000 字）/ Question too long")
+    agent.check_quota(user)
+    q, cancel = agent.run_in_thread(user, conv, question)
+
+    async def events():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    cancel.set()  # user pressed stop / closed the page: stop the model, keep what was written
+                    break
+                try:
+                    ev = await asyncio.to_thread(q.get, True, 0.5)
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                if ev is None:
+                    break
+                yield "data: " + json.dumps(ev, ensure_ascii=False, default=str) + "\n\n"
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/ai/usage")
+def ai_usage(user=Depends(ai_user)):
+    return {"used": agent.usage_for(user["id"]), "limits": agent.limits_for(user)}
+
+
+@app.get("/api/ai/usage/all")
+def ai_usage_all(user=Depends(admin)):
+    day = agent.today()
+    month = day[:7]
+    rows = db.q("SELECT u.id, u.username, u.display_name, u.ai_daily_questions, u.ai_daily_tokens, "
+                "coalesce((SELECT questions FROM ai_usage a WHERE a.user_id=u.id AND a.day=?),0) q_today, "
+                "coalesce((SELECT tokens FROM ai_usage a WHERE a.user_id=u.id AND a.day=?),0) t_today, "
+                "coalesce((SELECT sum(questions) FROM ai_usage a WHERE a.user_id=u.id AND substr(a.day,1,7)=?),0) q_month, "
+                "coalesce((SELECT sum(tokens) FROM ai_usage a WHERE a.user_id=u.id AND substr(a.day,1,7)=?),0) t_month "
+                "FROM users u ORDER BY t_month DESC, u.id", (day, day, month, month))
+    for r in rows:
+        r["limits"] = agent.limits_for(r)
+    total = db.q("SELECT coalesce(sum(tokens),0) n FROM ai_usage WHERE day=?", (day,), one=True)["n"]
+    return {"users": rows, "global_today": total, "global_limit": int(llm.load_config()["ai_global_daily_tokens"])}
 
 
 # ================= settings (admin) =================

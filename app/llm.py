@@ -20,7 +20,13 @@ PROVIDERS = {
 }
 
 DEFAULT_CONFIG = {"provider": "deepseek", "base_url": PROVIDERS["deepseek"]["base_url"],
-                  "model": PROVIDERS["deepseek"]["model"], "api_key": "", "max_tokens": 8192, "timeout": 300}
+                  "model": PROVIDERS["deepseek"]["model"], "api_key": "", "max_tokens": 8192, "timeout": 300,
+                  # AI assistant
+                  "chat_model": "",                  # empty = same as extraction model
+                  "ai_daily_questions": 100,         # per user per day (users can have an override)
+                  "ai_daily_tokens": 500000,         # per user per day
+                  "ai_global_daily_tokens": 5000000, # whole system per day
+                  "ai_per_minute": 6}                # per user per minute
 
 MAX_INPUT_CHARS = 180_000
 
@@ -174,3 +180,57 @@ def extract_contract(pages):
 def test_connection(cfg):
     content = chat([{"role": "user", "content": 'Reply with JSON {"ok": true}'}], cfg, json_mode=True, max_tokens=20)
     return content
+
+
+def chat_stream(messages, tools=None, cfg=None, max_tokens=4096, cancel=None):
+    """Stream a chat completion. Yields ("content", text), ("tool_calls", [...]) once at the end if the model
+    asked for tools, and ("usage", {"prompt_tokens", "completion_tokens"}) when the API reports it.
+    `cancel` is a threading.Event; setting it stops reading (and closes the HTTP stream)."""
+    cfg = cfg or load_config()
+    if os.environ.get("CMS_FAKE_AGENT"):
+        from .fake_agent import fake_stream
+        yield from fake_stream(messages, tools, cancel)
+        return
+    if not cfg.get("api_key"):
+        raise RuntimeError("未配置 API Key，请联系管理员在“设置”中填写 / API key not configured")
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    payload = {"model": cfg.get("chat_model") or cfg["model"], "messages": messages, "temperature": 0.2,
+               "max_tokens": max_tokens, "stream": True, "stream_options": {"include_usage": True}}
+    if tools:
+        payload["tools"] = tools
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
+    calls = {}
+    with httpx.Client(timeout=httpx.Timeout(float(cfg.get("timeout") or 300), connect=20), trust_env=True) as client:
+        with client.stream("POST", url, json=payload, headers=headers) as r:
+            if r.status_code >= 400:
+                body = r.read().decode("utf-8", "ignore")
+                raise RuntimeError(f"LLM API error {r.status_code}: {body[:400]}")
+            for line in r.iter_lines():
+                if cancel is not None and cancel.is_set():
+                    return
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    yield "usage", chunk["usage"]
+                for ch in chunk.get("choices") or []:
+                    delta = ch.get("delta") or {}
+                    if delta.get("content"):
+                        yield "content", delta["content"]
+                    for tc in delta.get("tool_calls") or []:
+                        slot = calls.setdefault(tc.get("index", 0), {"id": None, "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["arguments"] += fn["arguments"]
+    if calls:
+        yield "tool_calls", [calls[k] for k in sorted(calls)]

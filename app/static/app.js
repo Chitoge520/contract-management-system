@@ -18,7 +18,7 @@ const STATUSES = ['queued', 'reading', 'extracting', 'review', 'confirmed', 'fai
 const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
 const ROLES = ['admin', 'editor', 'viewer'];
-const ACTIONS = ['upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
+const ACTIONS = ['ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
   'lifecycle_status', 'notes', 'login', 'login_failed', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
 // permission check: 'admin' = administrators; otherwise a permission key such as 'contract.upload'
 const can = p => !!store.user && (p === 'admin' ? store.user.role === 'admin' : (store.user.permissions || []).includes(p));
@@ -58,7 +58,7 @@ function statusTag(s) {
   return { review: 'warning', confirmed: 'success', failed: 'danger', queued: 'info', reading: 'primary', extracting: 'primary' }[s] || 'info';
 }
 function go(name, id, query) {
-  let h = name === 'list' ? '#/' : name === 'detail' ? '#/c/' + id : '#/' + name;
+  let h = name === 'list' ? '#/' : name === 'detail' ? '#/c/' + id : name === 'ai' ? '#/ai' + (id ? '/' + id : '') : '#/' + name;
   if (query) h += '?' + new URLSearchParams(query).toString();
   location.hash = h;
 }
@@ -68,6 +68,8 @@ function parseHash() {
   const query = Object.fromEntries(new URLSearchParams(qs || ''));
   const m = h.match(/^c\/(\d+)/);
   if (m) return { name: 'detail', id: Number(m[1]), query };
+  const ma = h.match(/^ai(?:\/(\d+))?/);
+  if (ma) return { name: 'ai', id: ma[1] ? Number(ma[1]) : null, query };
   for (const n of ['audit', 'users', 'settings']) if (h.startsWith(n)) return { name: n, id: null, query };
   return { name: 'list', id: null, query };
 }
@@ -449,6 +451,10 @@ const DetailView = {
       allDepts.value = await api('/api/departments');
       deptSel.value = (c.value.departments || []).map(d => d.id); deptDlg.value = true;
     }
+    async function askAI() {
+      try { const cv = await api('/api/ai/conversations', { method: 'POST', json: { contract_ids: [Number(props.id)] } }); go('ai', cv.id); }
+      catch (e) { ElMessage.error(e.message); }
+    }
     async function saveDept() {
       try {
         c.value.departments = await api('/api/contracts/' + props.id + '/departments', { method: 'PUT', json: { department_ids: deptSel.value } });
@@ -613,7 +619,7 @@ const DetailView = {
 
     return { c, d, draft, editing, tab, showPdf, pdfPage, pdfKey, pdfRef, pages, srcMode, find, saving, isPdf, cur, title, subTitle, recon,
       startEdit, cancelEdit, save, setMeta, confirmReview, unconfirm, onMore, addRow, removeRow, cols, basicFields, amountFields,
-      hl, shownPages, openPage, go, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows, deptDlg, deptSel, allDepts, openDept, saveDept };
+      hl, shownPages, openPage, go, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows, deptDlg, deptSel, allDepts, openDept, saveDept, askAI };
   },
   template: `
   <div v-if="c">
@@ -640,6 +646,7 @@ const DetailView = {
         </div>
       </div>
       <div class="actions">
+        <el-button v-if="can('ai.use') && c.data" @click="askAI"><el-icon><ChatDotRound /></el-icon>{{ t('askAI') }}</el-button>
         <el-button @click="showPdf = !showPdf" :type="showPdf ? '' : 'primary'" plain>
           <el-icon><Document /></el-icon>{{ showPdf ? t('hidePdf') : t('showPdf') }}</el-button>
         <el-select :model-value="c.lifecycle_status || 'active'" @change="v => setMeta('lifecycle_status', v)" style="width:120px" :disabled="!can('contract.edit')">
@@ -1085,16 +1092,235 @@ const UsersView = {
   </div>`,
 };
 
+// ---------- AI assistant ----------
+function renderAnswer(text, cites) {
+  const labels = {};
+  (cites || []).forEach(c => { labels[c.id] = c.label; });
+  let html = window.DOMPurify.sanitize(window.marked.parse(text || '', { breaks: true, gfm: true }),
+    { FORBID_TAGS: ['style', 'img', 'iframe', 'form', 'input'], FORBID_ATTR: ['style', 'onerror', 'onclick'] });
+  html = html.replace(/\[#(\d+)(?:\s*p\.?\s*(\d+))?\]/g, (m, id, p) =>
+    '<a class="cite" href="javascript:void 0" data-cid="' + id + '" data-page="' + (p || '') + '">' +
+    esc(labels[id] || ('#' + id)) + (p ? ' p.' + p : '') + '</a>');
+  return html;
+}
+function stepText(s) {
+  if (!s) return '';
+  if (s.kind === 'search') return t('st_search', { q: s.text || t('all'), n: s.count == null ? '?' : s.count });
+  if (s.kind === 'contract') return t('st_contract', { id: s.contract_id });
+  if (s.kind === 'text') return t('st_text', { q: s.text || '', n: s.count == null ? '?' : s.count });
+  if (s.kind === 'pages') return t('st_pages', { id: s.contract_id, p: (s.pages || []).join(', ') });
+  if (s.kind === 'items') return t('st_items', { q: s.text || t('all'), n: s.count == null ? '?' : s.count });
+  return s.kind;
+}
+function dayGroup(ts) {
+  const d = new Date((ts || '').replace(' ', 'T')); const now = new Date();
+  const days = Math.floor((new Date(now.toDateString()) - new Date(d.toDateString())) / 86400000);
+  return days <= 0 ? 'g_today' : days === 1 ? 'g_yesterday' : days < 7 ? 'g_week' : days < 30 ? 'g_month' : 'g_older';
+}
+
+const AIView = {
+  mixins: [mixin],
+  props: ['id'],
+  setup(props) {
+    const convs = ref([]); const search = ref(''); const conv = ref(null); const messages = ref([]);
+    const input = ref(''); const busy = ref(false); const usage = ref(null); const scopePick = ref([]); const scopeOptions = ref([]);
+    const scroller = ref(null); let controller = null; let debounce = null;
+    async function loadConvs() {
+      try { convs.value = await api('/api/ai/conversations?q=' + encodeURIComponent(search.value)); } catch (e) { ElMessage.error(e.message); }
+    }
+    async function loadUsage() { try { usage.value = await api('/api/ai/usage'); } catch (e) {} }
+    async function openConv(id) {
+      if (!id) { conv.value = null; messages.value = []; return; }
+      try { const c = await api('/api/ai/conversations/' + id); conv.value = c; messages.value = c.messages; scrollDown(); }
+      catch (e) { ElMessage.error(e.message); go('ai'); }
+    }
+    watch(search, () => { clearTimeout(debounce); debounce = setTimeout(loadConvs, 300); });
+    let justCreated = null;  // conversation created on this page: keep the streaming messages, don't reload
+    watch(() => props.id, id => { if (id && id === justCreated) return; openConv(id); });
+    onMounted(() => { loadConvs(); loadUsage(); openConv(props.id); });
+    onBeforeUnmount(() => { if (controller) controller.abort(); });
+    const groups = computed(() => {
+      const out = {};
+      convs.value.forEach(c => { const g = dayGroup(c.updated_at); (out[g] = out[g] || []).push(c); });
+      return ['g_today', 'g_yesterday', 'g_week', 'g_month', 'g_older'].filter(g => out[g]).map(g => ({ key: g, items: out[g] }));
+    });
+    function scrollDown() { nextTick(() => { const el = scroller.value; if (el) el.scrollTop = el.scrollHeight; }); }
+    async function searchContracts(q) {
+      try { scopeOptions.value = (await api('/api/contracts?q=' + encodeURIComponent(q || ''))).slice(0, 30); } catch (e) {}
+    }
+    function newChat() { go('ai'); conv.value = null; messages.value = []; scopePick.value = []; input.value = ''; }
+
+    async function send(text) {
+      const q = (text || input.value).trim();
+      if (!q || busy.value) return;
+      let c = conv.value;
+      if (!c) {
+        try { c = await api('/api/ai/conversations', { method: 'POST', json: { contract_ids: scopePick.value } }); }
+        catch (e) { ElMessage.error(e.message); return; }
+        conv.value = Object.assign(c, { messages: [] }); justCreated = c.id;
+        history.replaceState(null, '', '#/ai/' + c.id); store.route = parseHash();
+      }
+      input.value = '';
+      messages.value.push({ role: 'user', content: q });
+      const ans = reactive({ role: 'assistant', content: '', steps: [], citations: [], status: 'streaming' });
+      messages.value.push(ans); scrollDown();
+      busy.value = true; controller = new AbortController();
+      try {
+        const r = await fetch('/api/ai/conversations/' + c.id + '/messages', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: q }), signal: controller.signal });
+        if (!r.ok) {
+          let msg = r.status + ''; try { msg = (await r.json()).detail || msg; } catch (e) {}
+          ans.status = 'error'; ans.content = msg; messages.value.splice(messages.value.length - 2, 1);
+          throw new Error(msg);
+        }
+        const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+            const line = chunk.split('\n').find(l => l.startsWith('data: '));
+            if (!line) continue;
+            const ev = JSON.parse(line.slice(6));
+            if (ev.type === 'delta') { ans.content += ev.text; scrollDown(); }
+            else if (ev.type === 'step') ans.steps.push(ev.step);
+            else if (ev.type === 'error') { ans.error = ev.message; }
+            else if (ev.type === 'done') { ans.citations = ev.citations; ans.status = ev.status; ans.id = ev.message_id; }
+          }
+        }
+        if (ans.status === 'streaming') ans.status = 'done';
+      } catch (e) {
+        if (e.name === 'AbortError') ans.status = 'stopped';
+        else ElMessage.error(e.message);
+      } finally {
+        busy.value = false; controller = null; scrollDown(); loadUsage();
+        await loadConvs();
+        const fresh = conv.value && convs.value.find(x => x.id === conv.value.id);
+        if (fresh) conv.value.title = fresh.title;
+      }
+    }
+    function stop() { if (controller) controller.abort(); }
+    function onKey(e) { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }
+    function onAnswerClick(e) {
+      const a = e.target.closest('.cite'); if (!a) return;
+      go('detail', a.dataset.cid, a.dataset.page ? { p: a.dataset.page } : null);
+    }
+    async function copy(m) { try { await navigator.clipboard.writeText(m.content); ElMessage.success(t('copied')); } catch (e) {} }
+    async function rename(c) {
+      let v; try { v = (await ElMessageBox.prompt(t('renameChat'), t('rename'), { inputValue: c.title, confirmButtonText: t('save'), cancelButtonText: t('cancel') })).value; } catch (e) { return; }
+      await api('/api/ai/conversations/' + c.id, { method: 'PUT', json: { title: v } }); loadConvs();
+      if (conv.value && conv.value.id === c.id) conv.value.title = v;
+    }
+    async function remove(c) {
+      try { await ElMessageBox.confirm(t('deleteChatConfirm'), t('remove'), { type: 'warning', confirmButtonText: t('remove'), cancelButtonText: t('no') }); } catch (e) { return; }
+      await api('/api/ai/conversations/' + c.id, { method: 'DELETE' }); loadConvs();
+      if (conv.value && conv.value.id === c.id) newChat();
+    }
+    function onConvCmd(c, cmd) { if (cmd === 'rename') rename(c); if (cmd === 'delete') remove(c); }
+    const examples = computed(() => [t('ex1'), t('ex2'), t('ex3'), t('ex4')]);
+    return { convs, search, conv, messages, input, busy, usage, scopePick, scopeOptions, scroller, groups, newChat, send, stop,
+      onKey, onAnswerClick, copy, onConvCmd, searchContracts, examples, renderAnswer, stepText, go, store };
+  },
+  template: `
+  <div class="ai">
+    <aside class="ai-side">
+      <el-button type="primary" class="w100" @click="newChat"><el-icon><Plus /></el-icon>{{ t('newChat') }}</el-button>
+      <el-input v-model="search" :placeholder="t('searchChats')" clearable class="mt-s"><template #prefix><el-icon><Search /></el-icon></template></el-input>
+      <div class="conv-list">
+        <template v-for="g in groups" :key="g.key">
+          <div class="conv-group">{{ t(g.key) }}</div>
+          <div v-for="c in g.items" :key="c.id" class="conv" :class="{ on: conv && conv.id === c.id }" @click="go('ai', c.id)">
+            <span class="conv-title">{{ c.title }}</span>
+            <el-icon v-if="c.scope" class="conv-scope" :title="c.scope.map(s => s.label).join(', ')"><Paperclip /></el-icon>
+            <el-dropdown trigger="click" @command="cmd => onConvCmd(c, cmd)" @click.stop>
+              <el-icon class="conv-more" @click.stop><MoreFilled /></el-icon>
+              <template #dropdown><el-dropdown-menu>
+                <el-dropdown-item command="rename">{{ t('rename') }}</el-dropdown-item>
+                <el-dropdown-item command="delete" divided><span class="danger">{{ t('remove') }}</span></el-dropdown-item>
+              </el-dropdown-menu></template>
+            </el-dropdown>
+          </div>
+        </template>
+        <div v-if="!convs.length" class="muted small conv-empty">{{ search ? t('noMatch') : t('noChats') }}</div>
+      </div>
+      <div v-if="usage" class="usage-line">{{ t('usageToday', { q: usage.used.questions, ql: usage.limits.questions }) }}
+        <el-progress :percentage="Math.min(100, Math.round(100 * usage.used.tokens / Math.max(1, usage.limits.tokens)))" :show-text="false" :stroke-width="4" /></div>
+    </aside>
+
+    <section class="ai-main">
+      <div class="ai-head">
+        <div class="ai-title">{{ conv ? conv.title : t('aiTitle') }}</div>
+        <div class="ai-scope">
+          <template v-if="conv && conv.scope"><el-icon><Paperclip /></el-icon>
+            <el-tag v-for="s in conv.scope" :key="s.id" size="small" effect="plain" class="clickable" @click="go('detail', s.id)">{{ s.label }}</el-tag></template>
+          <span v-else-if="conv" class="muted small">{{ t('scopeAll') }}</span>
+        </div>
+      </div>
+
+      <div class="ai-scroll" ref="scroller" @click="onAnswerClick">
+        <div v-if="!messages.length" class="ai-welcome">
+          <h2>{{ t('aiWelcome') }}</h2>
+          <p class="note">{{ t('aiWelcomeText') }}</p>
+          <div v-if="!conv" class="scope-pick">
+            <el-select v-model="scopePick" multiple filterable remote :remote-method="searchContracts" @focus="searchContracts('')"
+              :placeholder="t('scopePickPh')" style="width:100%">
+              <el-option v-for="c in scopeOptions" :key="c.id" :value="c.id" :label="(c.contract_no ? c.contract_no + ' · ' : '') + (c.title_zh || c.title || c.file_name)" />
+            </el-select>
+          </div>
+          <div class="examples">
+            <button v-for="(e, i) in examples" :key="i" type="button" class="example" @click="send(e)">{{ e }}</button>
+          </div>
+        </div>
+
+        <div v-for="(m, i) in messages" :key="m.id || ('tmp' + i)" class="msg" :class="m.role">
+          <div v-if="m.role === 'user'" class="bubble">{{ m.content }}</div>
+          <div v-else class="answer">
+            <div v-if="m.steps && m.steps.length" class="steps">
+              <details :open="m.status === 'streaming'">
+                <summary>{{ m.status === 'streaming' && !m.content ? t('thinking') : t('consulted', { n: m.steps.length }) }}</summary>
+                <ul><li v-for="(s, j) in m.steps" :key="j">{{ stepText(s) }}</li></ul>
+              </details>
+            </div>
+            <div v-else-if="m.status === 'streaming' && !m.content" class="muted small thinking">{{ t('thinking') }}</div>
+            <div class="md" v-html="renderAnswer(m.content, m.citations)"></div>
+            <span v-if="m.status === 'streaming' && m.content" class="caret"></span>
+            <div v-if="m.status === 'stopped'" class="muted small">— {{ t('stopped') }}</div>
+            <div v-if="m.status === 'error' || m.error" class="err small">{{ m.error || m.content }}</div>
+            <div v-if="m.status !== 'streaming' && m.content" class="msg-tools">
+              <el-button link size="small" @click.stop="copy(m)"><el-icon><DocumentCopy /></el-icon>{{ t('copy') }}</el-button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <el-input v-model="input" type="textarea" :autosize="{ minRows: 1, maxRows: 6 }" :placeholder="t('askPh')" @keydown="onKey" :disabled="busy" />
+        <el-button v-if="!busy" type="primary" :disabled="!input.trim()" @click="send()"><el-icon><Promotion /></el-icon></el-button>
+        <el-button v-else type="danger" plain @click="stop"><el-icon><VideoPause /></el-icon>{{ t('stop') }}</el-button>
+      </div>
+      <div class="composer-note muted small">{{ t('aiDisclaimer') }}</div>
+    </section>
+  </div>`,
+};
+
 // ---------- settings view ----------
 const SettingsView = {
   mixins: [mixin],
   setup() {
-    const cfg = reactive({ provider: '', base_url: '', model: '', api_key: '', max_tokens: 8192 });
+    const cfg = reactive({ provider: '', base_url: '', model: '', api_key: '', max_tokens: 8192,
+      chat_model: '', ai_daily_questions: 100, ai_daily_tokens: 500000, ai_global_daily_tokens: 5000000, ai_per_minute: 6 });
+    const aiUsage = ref(null);
+    async function loadAiUsage() { try { aiUsage.value = await api('/api/ai/usage/all'); } catch (e) {} }
     const providers = ref({}); const keySet = ref(false); const keyMask = ref(''); const testing = ref(false); const saving = ref(false);
     async function load() {
       const r = await api('/api/settings');
       providers.value = r.providers;
-      Object.assign(cfg, { provider: r.config.provider, base_url: r.config.base_url, model: r.config.model, max_tokens: r.config.max_tokens, api_key: '' });
+      Object.assign(cfg, { provider: r.config.provider, base_url: r.config.base_url, model: r.config.model, max_tokens: r.config.max_tokens, api_key: '',
+        chat_model: r.config.chat_model || '', ai_daily_questions: r.config.ai_daily_questions, ai_daily_tokens: r.config.ai_daily_tokens,
+        ai_global_daily_tokens: r.config.ai_global_daily_tokens, ai_per_minute: r.config.ai_per_minute });
+      loadAiUsage();
       keySet.value = r.config.api_key_set; keyMask.value = r.config.api_key;
     }
     onMounted(load);
@@ -1115,7 +1341,7 @@ const SettingsView = {
       testing.value = false;
       if (r.ok) ElMessage.success(t('testOk')); else ElMessageBox.alert(r.error, t('testFail'), { type: 'error' });
     }
-    return { cfg, providers, keySet, keyMask, testing, saving, onProvider, save, test };
+    return { cfg, providers, keySet, keyMask, testing, saving, onProvider, save, test, aiUsage, fmt };
   },
   template: `
   <div class="settings">
@@ -1137,6 +1363,28 @@ const SettingsView = {
         </el-form-item>
       </el-form>
     </div>
+    <div class="card">
+      <h2>{{ t('aiAssistant') }}</h2>
+      <el-form label-width="190px" label-position="left">
+        <el-form-item :label="t('chatModel')"><el-input v-model="cfg.chat_model" :placeholder="t('chatModelPh')" /></el-form-item>
+        <el-form-item :label="t('qDaily')"><el-input-number v-model="cfg.ai_daily_questions" :min="0" :max="10000" /></el-form-item>
+        <el-form-item :label="t('tDaily')"><el-input-number v-model="cfg.ai_daily_tokens" :min="0" :max="100000000" :step="50000" /></el-form-item>
+        <el-form-item :label="t('tGlobal')"><el-input-number v-model="cfg.ai_global_daily_tokens" :min="0" :max="1000000000" :step="500000" /></el-form-item>
+        <el-form-item :label="t('qMinute')"><el-input-number v-model="cfg.ai_per_minute" :min="1" :max="100" /></el-form-item>
+        <el-form-item><el-button type="primary" :loading="saving" @click="save">{{ t('save') }}</el-button>
+          <span class="muted small ml-s">{{ t('quotaHelp') }}</span></el-form-item>
+      </el-form>
+      <template v-if="aiUsage">
+        <h2 class="mt">{{ t('aiUsageTitle') }} <span class="muted">{{ t('globalToday', { u: fmt(aiUsage.global_today), l: fmt(aiUsage.global_limit) }) }}</span></h2>
+        <el-table :data="aiUsage.users" size="small" border>
+          <el-table-column :label="t('user')" min-width="120"><template #default="{ row }">{{ row.display_name || row.username }}</template></el-table-column>
+          <el-table-column :label="t('qToday')" width="120" align="right"><template #default="{ row }">{{ row.q_today }} / {{ row.limits.questions }}</template></el-table-column>
+          <el-table-column :label="t('tToday')" width="170" align="right"><template #default="{ row }">{{ fmt(row.t_today) }} / {{ fmt(row.limits.tokens) }}</template></el-table-column>
+          <el-table-column :label="t('qMonth')" width="110" align="right"><template #default="{ row }">{{ row.q_month }}</template></el-table-column>
+          <el-table-column :label="t('tMonth')" width="130" align="right"><template #default="{ row }">{{ fmt(row.t_month) }}</template></el-table-column>
+        </el-table>
+      </template>
+    </div>
     <div class="card"><h2>{{ t('privacyTitle') }}</h2><p class="note">{{ t('privacyText') }}</p></div>
     <div class="card"><h2>{{ t('backupTitle') }}</h2><p class="note">{{ t('backupText') }}</p>
       <el-button tag="a" href="/api/backup"><el-icon><Download /></el-icon>{{ t('backupBtn') }}</el-button></div>
@@ -1146,7 +1394,7 @@ const SettingsView = {
 // ---------- root ----------
 const Root = {
   mixins: [mixin],
-  components: { AuthView, ListView, DetailView, AuditView, UsersView, SettingsView },
+  components: { AuthView, ListView, DetailView, AuditView, UsersView, SettingsView, AIView },
   setup() {
     const epLocale = computed(() => store.lang === 'zh' ? ElementPlusLocaleZhCn : ElementPlusLocaleEn);
     function sync() { store.route = parseHash(); window.scrollTo(0, 0); }
@@ -1175,6 +1423,7 @@ const Root = {
       const n = store.route.name;
       if ((n === 'users' || n === 'settings') && !can('admin')) return false;
       if (n === 'audit' && !can('audit.view')) return false;
+      if (n === 'ai' && !can('ai.use')) return false;
       return true;
     });
     return { store, epLocale, toggleLang, active, go, onUserCmd, pwDlg, pw, changePw, allowed };
@@ -1189,6 +1438,7 @@ const Root = {
             <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
           <el-menu :default-active="active" @select="k => go(k)" background-color="transparent" text-color="#C9D3DD" active-text-color="#ffffff" class="nav-menu">
             <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
+            <el-menu-item v-if="can('ai.use')" index="ai"><el-icon><ChatDotRound /></el-icon><span>{{ t('navAI') }}</span></el-menu-item>
             <el-menu-item v-if="can('audit.view')" index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
             <el-menu-item v-if="can('admin')" index="users"><el-icon><User /></el-icon><span>{{ t('navUsers') }}</span></el-menu-item>
             <el-menu-item v-if="can('admin')" index="settings"><el-icon><Setting /></el-icon><span>{{ t('navSettings') }}</span></el-menu-item>
@@ -1213,11 +1463,12 @@ const Root = {
             </div>
           </div>
         </aside>
-        <main class="main">
+        <main class="main" :class="{ 'main-ai': store.route.name === 'ai' }">
           <template v-if="allowed">
             <ListView v-if="store.route.name === 'list'" :key="'l' + (store.route.query.q || '')" />
             <DetailView v-else-if="store.route.name === 'detail'" :id="store.route.id" :key="'d' + store.route.id + JSON.stringify(store.route.query)" />
             <AuditView v-else-if="store.route.name === 'audit'" />
+            <AIView v-else-if="store.route.name === 'ai'" :id="store.route.id" />
             <UsersView v-else-if="store.route.name === 'users'" />
             <SettingsView v-else-if="store.route.name === 'settings'" />
           </template>
