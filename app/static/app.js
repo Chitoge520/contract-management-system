@@ -20,7 +20,7 @@ const STATUSES = ['queued', 'reading', 'extracting', 'review', 'confirmed', 'fai
 const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
 const ROLES = ['admin', 'editor', 'viewer'];
-const ACTIONS = ['payment_add', 'payment_update', 'payment_delete', 'payment_file_add', 'payment_file_delete', 'register', 'user_approve', 'user_reject', 'ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
+const ACTIONS = ['project', 'project_create', 'project_update', 'project_delete', 'payment_add', 'payment_update', 'payment_delete', 'payment_file_add', 'payment_file_delete', 'register', 'user_approve', 'user_reject', 'ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
   'lifecycle_status', 'notes', 'login', 'login_failed', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
 // permission check: 'admin' = administrators; otherwise a permission key such as 'contract.upload'
 const can = p => !!store.user && (p === 'admin' ? store.user.role === 'admin' : (store.user.permissions || []).includes(p));
@@ -72,7 +72,7 @@ function parseHash() {
   if (m) return { name: 'detail', id: Number(m[1]), query };
   const ma = h.match(/^ai(?:\/(\d+))?/);
   if (ma) return { name: 'ai', id: ma[1] ? Number(ma[1]) : null, query };
-  for (const n of ['audit', 'users', 'settings', 'payments']) if (h.startsWith(n)) return { name: n, id: null, query };
+  for (const n of ['audit', 'users', 'settings', 'payments', 'projects']) if (h.startsWith(n)) return { name: n, id: null, query };
   return { name: 'list', id: null, query };
 }
 function pathLabel(path) {
@@ -146,13 +146,17 @@ const AuditDetail = {
       if (r.action === 'payment_update') return d.payment + ': ' + Object.entries(d.changes || {}).map(([k, v]) =>
         k === 'status' ? t('ps_' + v[0]) + '→' + t('ps_' + v[1]) : t('pf_' + k) + ' ' + (v[0] ?? '—') + '→' + (v[1] ?? '—')).join(', ');
       if (r.action === 'payment_add' || r.action === 'payment_delete') return d.payment;
+      if (r.action === 'project') return (d.old || t('noProject')) + ' → ' + (d.new || t('noProject'));
+      if (r.action === 'project_create') return d.name + (d.code ? ' · ' + d.code : '');
+      if (r.action === 'project_delete') return d.name + (d.contracts ? ' · ' + t('projectDeletedContracts', { n: d.contracts }) : '');
+      if (r.action === 'project_update') return d.name + ': ' + Object.keys(d.changes || {}).map(k => t('pj_' + k)).join(', ');
       if (r.action === 'payment_file_add' || r.action === 'payment_file_delete') return d.payment + ' · ' + d.file;
       if (r.action === 'extracted') return (d.model || '') + (d.items != null ? ' · ' + d.items + ' items' : '');
       if (r.action === 'extract_failed') return d.error;
       if (r.action === 'upload' || r.action === 'delete') return d.file === r.contract_label ? '' : d.file;
       if (r.action === 'export') return d.contracts + ' contracts';
       if (r.action === 'login') return d.ip ? 'IP ' + d.ip : '';
-      if (r.action === 'login_failed') return (d.username || '') + (d.ip ? ' · IP ' + d.ip : '');
+      if (r.action === 'login_failed') return (d.username ? t('employeeNo') + ' ' + d.username : '') + (d.ip ? ' · IP ' + d.ip : '');
       if (r.action === 'settings') return Object.keys(d).join(', ');
       if (r.action === 'departments') return ((d.old || []).join('、') || t('companyWide')) + ' → ' + ((d.new || []).join('、') || t('companyWide'));
       if (r.action === 'dept_create' || r.action === 'dept_delete' || r.action === 'role_create' || r.action === 'role_delete') return d.name;
@@ -285,7 +289,7 @@ const AuthView = {
   setup() {
     // mode: login | register | done (registration submitted); first run uses the setup form
     const mode = ref('login');
-    const f = reactive({ username: '', password: '', password2: '', display_name: '', employee_no: '', captcha: '' });
+    const f = reactive({ account: '', password: '', password2: '', display_name: '', employee_no: '', captcha: '' });
     const busy = ref(false);
     const cap = reactive({ id: '', image: '' });
     async function loadCaptcha() {
@@ -294,7 +298,6 @@ const AuthView = {
     }
     onMounted(() => { if (!store.needsSetup) loadCaptcha(); });
     const rules = computed(() => ({
-      user: /^[A-Za-z0-9]{3,32}$/.test(f.username),
       len: f.password.length >= 10,
       letter: /[A-Za-z]/.test(f.password),
       digit: /\d/.test(f.password),
@@ -304,9 +307,9 @@ const AuthView = {
     const isForm = computed(() => store.needsSetup || mode.value === 'register');
     const formOk = computed(() => {
       const r = rules.value;
-      return r.user && r.len && r.letter && r.digit && r.same && r.emp && !!f.display_name.trim();
+      return r.len && r.letter && r.digit && r.same && r.emp && !!f.display_name.trim();
     });
-    function reset() { Object.assign(f, { username: '', password: '', password2: '', display_name: '', employee_no: '', captcha: '' }); }
+    function reset() { Object.assign(f, { account: '', password: '', password2: '', display_name: '', employee_no: '', captcha: '' }); }
     function switchTo(m) { mode.value = m; reset(); if (m !== 'done') loadCaptcha(); }
     async function submit() {
       if (isForm.value && !formOk.value) { ElMessage.error(t('fixForm')); return; }
@@ -314,13 +317,13 @@ const AuthView = {
       busy.value = true;
       try {
         if (store.needsSetup) {
-          const r = await api('/api/auth/setup', { method: 'POST', json: { username: f.username, password: f.password, display_name: f.display_name, employee_no: f.employee_no.trim() } });
+          const r = await api('/api/auth/setup', { method: 'POST', json: { password: f.password, display_name: f.display_name, employee_no: f.employee_no.trim() } });
           store.user = r.user; store.needsSetup = false;
         } else if (mode.value === 'register') {
-          await api('/api/auth/register', { method: 'POST', json: { username: f.username, password: f.password, password2: f.password2, display_name: f.display_name, employee_no: f.employee_no.trim(), captcha_id: cap.id, captcha: f.captcha } });
+          await api('/api/auth/register', { method: 'POST', json: { password: f.password, password2: f.password2, display_name: f.display_name, employee_no: f.employee_no.trim(), captcha_id: cap.id, captcha: f.captcha } });
           mode.value = 'done';
         } else {
-          const r = await api('/api/auth/login', { method: 'POST', json: { username: f.username, password: f.password, captcha_id: cap.id, captcha: f.captcha } });
+          const r = await api('/api/auth/login', { method: 'POST', json: { account: f.account.trim(), password: f.password, captcha_id: cap.id, captcha: f.captcha } });
           store.user = r.user;
         }
       } catch (e) { ElMessage.error(e.message); if (!store.needsSetup) loadCaptcha(); }  // a captcha works only once
@@ -346,14 +349,15 @@ const AuthView = {
         <p v-if="store.needsSetup" class="note">{{ t('setupText') }}</p>
         <p v-else-if="mode === 'register'" class="note">{{ t('registerText') }}</p>
         <el-form label-position="top" @submit.prevent="submit">
-          <el-form-item :label="t('username')">
-            <el-input v-model="f.username" autocomplete="username" autofocus maxlength="32" />
-            <div v-if="isForm" class="rule" :class="{ ok: rules.user, bad: f.username && !rules.user }">{{ rules.user ? '✓' : '•' }} {{ t('ruleUsername') }}</div>
+          <el-form-item v-if="!isForm" :label="t('employeeNo')">
+            <el-input v-model="f.account" autocomplete="username" autofocus maxlength="32" :placeholder="t('loginAccountPh')" />
+            <div class="rule">{{ t('loginHint') }}</div>
           </el-form-item>
           <template v-if="isForm">
             <el-form-item :label="t('displayName')"><el-input v-model="f.display_name" maxlength="40" /></el-form-item>
             <el-form-item :label="t('employeeNo')">
-              <el-input v-model="f.employee_no" maxlength="32" :placeholder="t('employeeNoPh')" />
+              <el-input v-model="f.employee_no" maxlength="32" :placeholder="t('employeeNoPh')" autocomplete="username" />
+              <div class="rule">• {{ t('empIsAccount') }}</div>
               <div class="rule" :class="{ ok: rules.emp, bad: f.employee_no && !rules.emp }">{{ rules.emp ? '✓' : '•' }} {{ t('ruleEmployeeNo') }}</div>
             </el-form-item>
           </template>
@@ -452,7 +456,9 @@ const ListView = {
     const rows = ref([]); const stats = ref({ by_status: {}, parties: [], years: [], count: 0 });
     const loading = ref(true); const showUpload = ref(false); const uploader = ref(null);
     const up = reactive({ total: 0, done: 0, created: 0 });
-    const f = reactive({ q: store.route.query.q || '', type: '', party: '', year: '', status: '', lifecycle: '', dept: '' });
+    const f = reactive({ q: store.route.query.q || '', type: '', party: '', year: '', status: '', lifecycle: '', dept: '', project: store.route.query.project || '' });
+    const projects = ref([]);
+    api('/api/projects').then(r => { projects.value = r.projects; }).catch(() => {});
     const depts = ref([]);
     api('/api/departments').then(r => { depts.value = r; }).catch(() => {});
     const page = ref(1); const total = ref(0);
@@ -478,13 +484,13 @@ const ListView = {
       if (rows.value.some(r => WORKING.includes(r.status))) timer = setTimeout(load, 3000);
     }
     function firstPage() { page.value = 1; load(); }
-    watch(() => [f.type, f.party, f.year, f.status, f.lifecycle, f.dept], firstPage);
+    watch(() => [f.type, f.party, f.year, f.status, f.lifecycle, f.dept, f.project], firstPage);
     watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(firstPage, 300); });
     function onPage(n) { page.value = n; load(); window.scrollTo(0, 0); }
     function onPageSize(n) { pageSize.value = n; try { localStorage.setItem('cms_page_size', n); } catch (e) {} firstPage(); }
     onMounted(load);
     onBeforeUnmount(() => clearTimeout(timer));
-    const filtered = computed(() => !!(f.q || f.type || f.party || f.year || f.status || f.lifecycle || f.dept));
+    const filtered = computed(() => !!(f.q || f.type || f.party || f.year || f.status || f.lifecycle || f.dept || f.project));
     const searching = computed(() => !!f.q.trim());
     const working = computed(() => WORKING.reduce((a, s) => a + (stats.value.by_status[s] || 0), 0));
 
@@ -511,7 +517,7 @@ const ListView = {
     // every contract that matches the filters, on all pages
     function exportXlsx() { location.href = '/api/export.xlsx?' + filterParams().toString(); }
     function titleOf(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || r.file_name; }
-    return { depts, rows, stats, f, loading, filtered, page, pageSize, total, onPage, onPageSize, searching, working, showUpload, uploader, up, onChange, onUploaded, onUploadError,
+    return { projects, depts, rows, stats, f, loading, filtered, page, pageSize, total, onPage, onPageSize, searching, working, showUpload, uploader, up, onChange, onUploaded, onUploadError,
       onDialogClosed, exportXlsx, titleOf, TYPES, STATUSES, LIFECYCLES, WORKING, go };
   },
   template: `
@@ -546,6 +552,9 @@ const ListView = {
         <el-option v-for="d in depts" :key="d.id" :value="String(d.id)" :label="d.name" /></el-select>
       <el-select v-model="f.lifecycle" :placeholder="t('lifecycle')" clearable style="width:130px">
         <el-option v-for="x in LIFECYCLES" :key="x" :value="x" :label="t('l_' + x)" /></el-select>
+      <el-select v-if="projects.length" v-model="f.project" :placeholder="t('project')" clearable filterable style="width:180px">
+        <el-option value="none" :label="t('noProject')" />
+        <el-option v-for="p in projects" :key="p.id" :value="String(p.id)" :label="p.name" /></el-select>
     </div>
 
     <SearchResults v-if="searching && rows.length" :rows="rows" :q="f.q" />
@@ -558,6 +567,7 @@ const ListView = {
         <el-table-column :label="t('title')" min-width="220">
           <template #default="{ row }">
             <div class="t-title">{{ titleOf(row) }}</div>
+            <div v-if="row.project_name" class="proj-line"><el-icon><FolderOpened /></el-icon>{{ row.project_name }}</div>
             <div class="muted small" v-if="WORKING.includes(row.status)">{{ row.progress }}</div>
           </template></el-table-column>
         <el-table-column v-if="vw >= 1300" :label="t('type')" width="90">
@@ -831,15 +841,17 @@ const PaymentPanel = {
 const PaymentsView = {
   mixins: [mixin], components: { PaymentPanel },
   setup() {
-    const f = reactive({ status: store.route.query.status || 'pending', q: '', year: '' });
+    const f = reactive({ status: store.route.query.status || 'pending', q: '', year: '', project: store.route.query.project || '' });
     const rows = ref([]); const total = ref(0); const page = ref(1); const pageSize = ref(20); const today = ref(todayStr());
-    const loading = ref(true); const years = ref([]); const expanded = ref([]); const table = ref(null);
+    const loading = ref(true); const years = ref([]); const expanded = ref([]); const table = ref(null); const projects = ref([]);
+    api('/api/projects').then(r => { projects.value = r.projects; }).catch(() => {});
     let debounce = null, seq = 0;
     async function load(keepOrder) {
       const my = ++seq;
       const p = new URLSearchParams({ page: page.value, page_size: pageSize.value, status: f.status });
       if (f.q) p.set('q', f.q);
       if (f.year) p.set('year', f.year);
+      if (f.project) p.set('project', f.project);
       try {
         const r = await api('/api/payments/contracts?' + p.toString());
         if (my !== seq) return;
@@ -855,14 +867,14 @@ const PaymentsView = {
     function refresh() { load(true); }
     api('/api/stats').then(s => { years.value = s.years; }).catch(() => {});
     function firstPage() { page.value = 1; expanded.value = []; load(); }
-    watch(() => [f.status, f.year], firstPage);
+    watch(() => [f.status, f.year, f.project], firstPage);
     watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(firstPage, 300); });
     onMounted(load);
     function contractTitle(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || ''; }
     function onPage(n) { page.value = n; expanded.value = []; load(); window.scrollTo(0, 0); }
     function toggle(row) { table.value && table.value.toggleRowExpansion(row); }
     function onExpand(row, list) { expanded.value = list.map(r => r.contract_id); }
-    return { f, rows, total, page, pageSize, today, loading, years, expanded, table, load, refresh, contractTitle, onPage, toggle, onExpand, go };
+    return { f, rows, total, page, pageSize, today, loading, years, projects, expanded, table, load, refresh, contractTitle, onPage, toggle, onExpand, go };
   },
   template: `
   <div>
@@ -878,6 +890,9 @@ const PaymentsView = {
       </el-radio-group>
       <el-input v-model="f.q" :placeholder="t('paySearch')" clearable class="grow"><template #prefix><el-icon><Search /></el-icon></template></el-input>
       <el-select v-model="f.year" :placeholder="t('year')" clearable style="width:110px"><el-option v-for="y in years" :key="y" :value="y" :label="y" /></el-select>
+      <el-select v-if="projects.length" v-model="f.project" :placeholder="t('project')" clearable filterable style="width:180px">
+        <el-option value="none" :label="t('noProject')" />
+        <el-option v-for="p in projects" :key="p.id" :value="String(p.id)" :label="p.name" /></el-select>
     </div>
     <div class="panel" v-loading="loading">
       <el-table v-if="rows.length" ref="table" :data="rows" row-key="contract_id" style="width:100%" class="pay-contracts"
@@ -892,6 +907,7 @@ const PaymentsView = {
             <a href="javascript:void 0" class="mono-ish" @click.stop="go('detail', row.contract_id, { tab: 'payments' })">{{ row.contract_no || ('#' + row.contract_id) }}</a>
             <div class="t-title">{{ contractTitle(row) }}</div>
             <div class="muted small">{{ row.party_b }}</div>
+            <div v-if="row.project_name" class="proj-line"><el-icon><FolderOpened /></el-icon>{{ row.project_name }}</div>
             <div v-if="vw < 640" class="pay-phone">
               <div><span class="muted small">{{ t('payProgress') }}</span> <b>{{ row.paid }} / {{ row.nodes }}</b></div>
               <div v-for="x in row.totals" :key="x.currency"><span class="muted small">{{ t('payUnpaid') }}</span>
@@ -937,6 +953,87 @@ const PaymentsView = {
   </div>`,
 };
 
+// ---------- projects ----------
+const ProjectsView = {
+  mixins: [mixin],
+  setup() {
+    const rows = ref([]); const without = ref(0); const loading = ref(true); const q = ref('');
+    const dlg = ref(false); const busy = ref(false); const form = reactive({ id: null, name: '', code: '', note: '' });
+    async function load() {
+      try { const r = await api('/api/projects'); rows.value = r.projects; without.value = r.without_project; }
+      catch (e) { ElMessage.error(e.message); }
+      loading.value = false;
+    }
+    onMounted(load);
+    const shown = computed(() => {
+      const k = q.value.trim().toLowerCase();
+      return k ? rows.value.filter(p => (p.name + ' ' + (p.code || '') + ' ' + (p.note || '')).toLowerCase().includes(k)) : rows.value;
+    });
+    function openNew() { Object.assign(form, { id: null, name: '', code: '', note: '' }); dlg.value = true; }
+    function openEdit(p) { Object.assign(form, { id: p.id, name: p.name, code: p.code || '', note: p.note || '' }); dlg.value = true; }
+    async function save() {
+      if (!form.name.trim()) { ElMessage.error(t('projectNameNeeded')); return; }
+      busy.value = true;
+      try {
+        const body = { name: form.name, code: form.code, note: form.note };
+        if (form.id) await api('/api/projects/' + form.id, { method: 'PUT', json: body });
+        else await api('/api/projects', { method: 'POST', json: body });
+        dlg.value = false; ElMessage.success(t('saved')); load();
+      } catch (e) { ElMessage.error(e.message); }
+      busy.value = false;
+    }
+    async function remove(p) {
+      try { await ElMessageBox.confirm(t('projectDeleteConfirm', { n: p.name, c: p.contracts }), { type: 'warning' }); } catch (e) { return; }
+      try { await api('/api/projects/' + p.id, { method: 'DELETE' }); ElMessage.success(t('deleted')); load(); }
+      catch (e) { ElMessage.error(e.message); }
+    }
+    return { rows, without, loading, q, shown, dlg, busy, form, openNew, openEdit, save, remove, go };
+  },
+  template: `
+  <div>
+    <div class="ph">
+      <div><h1>{{ t('navProjects') }}</h1><div class="sub">{{ t('projectsSub') }}</div></div>
+      <div class="actions"><el-button v-if="can('project.manage')" type="primary" @click="openNew"><el-icon><Plus /></el-icon>{{ t('newProject') }}</el-button></div>
+    </div>
+    <div class="filters"><el-input v-model="q" :placeholder="t('projectSearch')" clearable class="grow"><template #prefix><el-icon><Search /></el-icon></template></el-input></div>
+    <div class="panel" v-loading="loading">
+      <el-table v-if="shown.length" :data="shown" style="width:100%" @row-click="p => go('list', null, { project: p.id })" row-class-name="click">
+        <el-table-column :label="t('project')" min-width="200">
+          <template #default="{ row }"><div class="t-title">{{ row.name }}</div>
+            <div class="muted small" v-if="row.code || row.note">{{ [row.code, row.note].filter(Boolean).join(' · ') }}</div></template></el-table-column>
+        <el-table-column :label="t('contractCount')" width="90" align="right" prop="contracts" />
+        <el-table-column v-if="vw >= 900" :label="t('projectValue')" width="180" align="right">
+          <template #default="{ row }"><div v-for="v in row.values" :key="v.currency" class="money"><span class="cur">{{ v.currency }}</span> <span class="amt">{{ fmt(v.total) }}</span></div>
+            <span v-if="!row.values.length" class="muted">—</span></template></el-table-column>
+        <el-table-column :label="t('payProgress')" width="130">
+          <template #default="{ row }"><template v-if="row.nodes">
+            <div class="num" :class="{ danger: row.overdue }">{{ row.paid }} / {{ row.nodes }}</div>
+            <el-progress :percentage="Math.round(100 * row.paid / row.nodes)" :show-text="false" :stroke-width="5" :status="row.paid === row.nodes ? 'success' : ''" />
+            <el-tag v-if="row.overdue" type="danger" size="small" effect="plain" class="mt-xs">{{ t('ps_overdue') }} {{ row.overdue }}</el-tag>
+          </template><span v-else class="muted">—</span></template></el-table-column>
+        <el-table-column :width="vw >= 640 ? 230 : 90" align="right">
+          <template #default="{ row }">
+            <el-button link type="primary" size="small" @click.stop="go('payments', null, { project: row.id, status: '' })">{{ t('navPayments') }}</el-button>
+            <template v-if="can('project.manage')">
+              <el-button link size="small" @click.stop="openEdit(row)">{{ t('edit') }}</el-button>
+              <el-button link type="danger" size="small" @click.stop="remove(row)">{{ t('remove') }}</el-button>
+            </template>
+          </template></el-table-column>
+      </el-table>
+      <el-empty v-else-if="!loading" :description="q ? t('noMatch') : t('noProjects')" />
+    </div>
+    <p v-if="without" class="note mt-s"><a href="javascript:void 0" @click="go('list', null, { project: 'none' })">{{ t('withoutProject', { n: without }) }}</a></p>
+    <el-dialog v-model="dlg" :title="form.id ? t('editProject') : t('newProject')" width="460px">
+      <el-form label-width="96px" label-position="left" @submit.prevent="save">
+        <el-form-item :label="t('projectName')" required><el-input v-model="form.name" maxlength="100" /></el-form-item>
+        <el-form-item :label="t('projectCode')"><el-input v-model="form.code" maxlength="50" :placeholder="t('optional')" /></el-form-item>
+        <el-form-item :label="t('projectNote')"><el-input v-model="form.note" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" maxlength="500" :placeholder="t('optional')" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="dlg = false">{{ t('cancel') }}</el-button><el-button type="primary" :loading="busy" @click="save">{{ t('save') }}</el-button></template>
+    </el-dialog>
+  </div>`,
+};
+
 // ---------- detail view ----------
 const DetailView = {
   mixins: [mixin], components: { PageRef, DataTable, AuditDetail, PaymentPanel, FieldInput },
@@ -951,6 +1048,23 @@ const DetailView = {
     const pages = ref([]); const srcMode = ref('masked'); const find = ref(query.tab === 'source' ? (query.q || '') : ''); const saving = ref(false);
     const historyRows = ref([]);
     const deptDlg = ref(false); const deptSel = ref([]); const allDepts = ref([]);
+    const projDlg = ref(false); const projSel = ref(null); const allProjects = ref([]); const projSaving = ref(false);
+    async function openProject() {
+      try { allProjects.value = (await api('/api/projects')).projects; } catch (e) { ElMessage.error(e.message); return; }
+      projSel.value = c.value.project ? c.value.project.id : null; projDlg.value = true;
+    }
+    async function saveProject() {
+      projSaving.value = true;
+      try {
+        let pid = projSel.value;
+        if (typeof pid === 'string' && pid.trim()) {  // a new name typed in the box: create the project first
+          pid = (await api('/api/projects', { method: 'POST', json: { name: pid.trim() } })).id;
+        }
+        c.value = await api('/api/contracts/' + props.id + '/project', { method: 'PUT', json: { project_id: pid || null } });
+        projDlg.value = false; ElMessage.success(t('saved'));
+      } catch (e) { ElMessage.error(e.message); }
+      projSaving.value = false;
+    }
     async function openDept() {
       allDepts.value = await api('/api/departments');
       deptSel.value = (c.value.departments || []).map(d => d.id); deptDlg.value = true;
@@ -1136,7 +1250,8 @@ const DetailView = {
 
     return { c, d, draft, editing, tab, showPdf, pdfPage, pdfKey, pdfRef, pages, srcMode, find, saving, isPdf, cur, title, subTitle, recon,
       startEdit, cancelEdit, save, setMeta, confirmReview, unconfirm, onMore, addRow, removeRow, cols, basicFields, amountFields,
-      hl, shownPages, openPage, go, FIELD_KIND, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows, deptDlg, deptSel, allDepts, openDept, saveDept, askAI };
+      hl, shownPages, openPage, go, FIELD_KIND, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows, deptDlg, deptSel, allDepts, openDept, saveDept, askAI,
+      projDlg, projSel, allProjects, projSaving, openProject, saveProject };
   },
   template: `
   <div v-if="c">
@@ -1152,6 +1267,11 @@ const DetailView = {
           <span v-if="c.page_count">{{ c.page_count }} {{ t('pages') }}<template v-if="c.ocr_pages"> · {{ c.ocr_pages }} {{ t('ocrPages') }}</template></span>
         </div>
         <div class="meta-row people">
+          <span class="dept-line"><el-icon><FolderOpened /></el-icon>
+            <a v-if="c.project" href="javascript:void 0" @click="go('list', null, { project: c.project.id })">{{ c.project.name }}</a>
+            <span v-else class="muted">{{ t('noProject') }}</span>
+            <el-button v-if="can('contract.edit')" link type="primary" size="small" @click="openProject">{{ t('changeProject') }}</el-button>
+          </span>
           <span class="dept-line"><el-icon><OfficeBuilding /></el-icon>
             <template v-if="(c.departments || []).length"><el-tag v-for="d in c.departments" :key="d.id" size="small" effect="plain">{{ d.name }}</el-tag></template>
             <el-tag v-else size="small" type="success" effect="plain">{{ t('companyWide') }}</el-tag>
@@ -1350,6 +1470,14 @@ const DetailView = {
         </div>
       </div>
     </div>
+    <el-dialog v-model="projDlg" :title="t('changeProject')" width="460px">
+      <el-select v-model="projSel" filterable clearable :allow-create="can('project.manage')" default-first-option style="width:100%"
+        :placeholder="t('noProject')">
+        <el-option v-for="p in allProjects" :key="p.id" :value="p.id" :label="p.name + (p.code ? ' · ' + p.code : '')" />
+      </el-select>
+      <p class="note mt-s">{{ can('project.manage') ? t('projectPickHelpCreate') : t('projectPickHelp') }}</p>
+      <template #footer><el-button @click="projDlg = false">{{ t('cancel') }}</el-button><el-button type="primary" :loading="projSaving" @click="saveProject">{{ t('save') }}</el-button></template>
+    </el-dialog>
     <el-dialog v-model="deptDlg" :title="t('changeDept')" width="460px">
       <el-select v-model="deptSel" multiple style="width:100%" :placeholder="t('companyWide')">
         <el-option v-for="d in allDepts" :key="d.id" :value="d.id" :label="d.name" />
@@ -1458,7 +1586,7 @@ const UsersView = {
           if (form.password) body.password = form.password;
           await api('/api/users/' + form.id, { method: 'PUT', json: body });
         } else {
-          await api('/api/users', { method: 'POST', json: Object.assign(body, { username: form.username, password: form.password }) });
+          await api('/api/users', { method: 'POST', json: Object.assign(body, { password: form.password }) });
         }
         dlg.value = false; ElMessage.success(t('saved')); loadAll();
       } catch (e) { ElMessage.error(e.message); }
@@ -1538,9 +1666,11 @@ const UsersView = {
       <el-tab-pane :label="t('tabUsers')" name="users">
         <div class="panel">
           <el-table :data="users" style="width:100%">
-            <el-table-column :label="t('username')" prop="username" width="130" />
+            <el-table-column :label="t('loginEmployeeNo')" min-width="120"><template #default="{ row }">
+              <span v-if="row.employee_no" class="mono-ish">{{ row.employee_no }}</span>
+              <el-tooltip v-else :content="t('noEmpTip', { u: row.username })"><el-tag type="warning" size="small" effect="plain">{{ t('noEmp') }}</el-tag></el-tooltip>
+            </template></el-table-column>
             <el-table-column :label="t('displayName')" prop="display_name" min-width="110" />
-            <el-table-column :label="t('employeeNo')" min-width="100"><template #default="{ row }"><span class="mono-ish">{{ row.employee_no || '—' }}</span></template></el-table-column>
             <el-table-column :label="t('department')" min-width="120"><template #default="{ row }">{{ row.department_name || '—' }}</template></el-table-column>
             <el-table-column :label="t('position')" min-width="110"><template #default="{ row }">{{ row.position || '—' }}</template></el-table-column>
             <el-table-column :label="t('role')" width="120"><template #default="{ row }">
@@ -1559,9 +1689,8 @@ const UsersView = {
         <p class="note">{{ t('pendingHelp') }}</p>
         <div class="panel">
           <el-table :data="pending" style="width:100%" :empty-text="t('noPending')">
-            <el-table-column :label="t('username')" prop="username" width="140" />
+            <el-table-column :label="t('loginEmployeeNo')" min-width="120"><template #default="{ row }"><span class="mono-ish">{{ row.employee_no }}</span></template></el-table-column>
             <el-table-column :label="t('displayName')" prop="display_name" min-width="110" />
-            <el-table-column :label="t('employeeNo')" min-width="110"><template #default="{ row }"><span class="mono-ish">{{ row.employee_no }}</span></template></el-table-column>
             <el-table-column :label="t('appliedAt')" width="170"><template #default="{ row }"><span class="num muted">{{ row.created_at }}</span></template></el-table-column>
             <el-table-column width="170" align="right"><template #default="{ row }">
               <el-button size="small" type="success" @click="openApprove(row)">{{ t('approve') }}</el-button>
@@ -1618,9 +1747,9 @@ const UsersView = {
 
     <el-dialog v-model="dlg" :title="form.id ? t('editUser') : t('addUser')" width="520px">
       <el-form label-width="110px" label-position="left" @submit.prevent="submit">
-        <el-form-item :label="t('username')"><el-input v-model="form.username" :disabled="!!form.id" maxlength="32" :placeholder="t('ruleUsername')" /></el-form-item>
         <el-form-item :label="t('displayName')"><el-input v-model="form.display_name" /></el-form-item>
-        <el-form-item :label="t('employeeNo')"><el-input v-model="form.employee_no" maxlength="32" :placeholder="t('employeeNoPh')" /></el-form-item>
+        <el-form-item :label="t('employeeNo')"><el-input v-model="form.employee_no" maxlength="32" :placeholder="t('employeeNoPh')" />
+          <div class="rule">• {{ t('empIsAccount') }}</div></el-form-item>
         <el-form-item :label="t('department')">
           <el-select v-model="form.department_id" clearable :placeholder="t('noDept')" style="width:100%">
             <el-option v-for="d in depts" :key="d.id" :value="d.id" :label="d.name" /></el-select></el-form-item>
@@ -1644,7 +1773,7 @@ const UsersView = {
     </el-dialog>
 
     <el-dialog v-model="apDlg" :title="t('approveTitle')" width="480px">
-      <p class="note">{{ ap.display_name }} · {{ ap.username }} · {{ t('employeeNo') }} {{ ap.employee_no }}</p>
+      <p class="note">{{ ap.display_name }} · {{ t('employeeNo') }} {{ ap.employee_no }}</p>
       <el-form label-width="96px" label-position="left">
         <el-form-item :label="t('role')">
           <el-select v-model="ap.role" style="width:100%"><el-option v-for="r in roles" :key="r.key" :value="r.key" :label="roleName(r.key)" /></el-select></el-form-item>
@@ -1985,7 +2114,7 @@ const SettingsView = {
 // ---------- root ----------
 const Root = {
   mixins: [mixin],
-  components: { AuthView, ListView, DetailView, AuditView, UsersView, SettingsView, AIView, PaymentsView },
+  components: { AuthView, ListView, DetailView, AuditView, UsersView, SettingsView, AIView, PaymentsView, ProjectsView },
   setup() {
     const epLocale = computed(() => store.lang === 'zh' ? ElementPlusLocaleZhCn : ElementPlusLocaleEn);
     function sync() { store.route = parseHash(); window.scrollTo(0, 0); }
@@ -2049,6 +2178,7 @@ const Root = {
             <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
           <el-menu :default-active="active" @select="k => go(k)" background-color="transparent" text-color="#C9D3DD" active-text-color="#ffffff" class="nav-menu">
             <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
+            <el-menu-item index="projects"><el-icon><FolderOpened /></el-icon><span>{{ t('navProjects') }}</span></el-menu-item>
             <el-menu-item index="payments"><el-icon><Wallet /></el-icon><span>{{ t('navPayments') }}</span></el-menu-item>
             <el-menu-item v-if="can('ai.use')" index="ai"><el-icon><ChatDotRound /></el-icon><span>{{ t('navAI') }}</span></el-menu-item>
             <el-menu-item v-if="can('audit.view')" index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
@@ -2078,10 +2208,11 @@ const Root = {
         </aside>
         <main class="main" :class="{ 'main-ai': store.route.name === 'ai' }">
           <template v-if="allowed">
-            <ListView v-if="store.route.name === 'list'" :key="'l' + (store.route.query.q || '')" />
+            <ListView v-if="store.route.name === 'list'" :key="'l' + (store.route.query.q || '') + '|' + (store.route.query.project || '')" />
             <DetailView v-else-if="store.route.name === 'detail'" :id="store.route.id" :key="'d' + store.route.id + JSON.stringify(store.route.query)" />
             <AuditView v-else-if="store.route.name === 'audit'" />
-            <PaymentsView v-else-if="store.route.name === 'payments'" />
+            <PaymentsView v-else-if="store.route.name === 'payments'" :key="'pay' + (store.route.query.project || '')" />
+            <ProjectsView v-else-if="store.route.name === 'projects'" />
             <AIView v-else-if="store.route.name === 'ai'" :id="store.route.id" />
             <UsersView v-else-if="store.route.name === 'users'" />
             <SettingsView v-else-if="store.route.name === 'settings'" />

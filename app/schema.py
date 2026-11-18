@@ -308,7 +308,28 @@ def step_payments(c):
             c.execute("UPDATE roles SET permissions=? WHERE key='editor'", (json.dumps(perms + ["payment.record"]),))
 
 
-MIGRATIONS = [step_baseline, step_foreign_keys, step_search_text, step_payments]
+# ---------------------------------------------------------------- step 5
+# Projects: a contract can belong to one project. Deleting a project leaves its contracts without a project.
+def step_projects(c):
+    c.execute("""CREATE TABLE projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        code TEXT,                  -- optional project number
+        note TEXT,
+        created_at TEXT,
+        created_by TEXT)""")
+    c.execute("CREATE UNIQUE INDEX idx_projects_name ON projects(name COLLATE NOCASE)")
+    if "project_id" not in _columns(c, "contracts"):
+        c.execute("ALTER TABLE contracts ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_contracts_project ON contracts(project_id)")
+    row = c.execute("SELECT permissions FROM roles WHERE key='editor'").fetchone()
+    if row:
+        perms = json.loads(row["permissions"] or "[]")
+        if "project.manage" not in perms:
+            c.execute("UPDATE roles SET permissions=? WHERE key='editor'", (json.dumps(perms + ["project.manage"]),))
+
+
+MIGRATIONS = [step_baseline, step_foreign_keys, step_search_text, step_payments, step_projects]
 LATEST = len(MIGRATIONS)
 
 

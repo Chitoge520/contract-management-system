@@ -406,3 +406,7 @@ mark { background: #FFE9A8; }
 .pay-phone .muted.small + .money, .pay-phone .muted.small + span { margin-left: 6px; }
 .proof-link.wide a { max-width: 100%; white-space: normal; word-break: break-all; }
 @media (max-width: 760px) { .shell { grid-template-columns: minmax(0, 1fr); } }  /* never wider than the screen */
+
+/* projects */
+.proj-line { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--el-color-primary-dark-2, #0b5d64);
+  background: var(--sea-tint, #e6f2f3); border-radius: 4px; padding: 0 6px; margin-top: 3px; }

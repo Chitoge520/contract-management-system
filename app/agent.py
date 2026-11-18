@@ -97,6 +97,7 @@ TOOLS = [
             "contract_type": {"type": "string", "enum": ["software", "purchase", "lease", "service", "other"]},
             "party": {"type": "string", "description": "Part of the supplier / counter-party name"},
             "year": {"type": "string", "description": "Signing or effective year, e.g. 2026"},
+            "project": {"type": "string", "description": "Part of the project name or project number"},
             "limit": {"type": "integer", "description": "Max results, default 20"}}}}},
     {"type": "function", "function": {
         "name": "get_contract",
@@ -142,13 +143,17 @@ def _ids_sql(ids):
     return ("(" + ",".join("?" * len(ids)) + ")", ids) if ids else ("(-1)", [])
 
 
-def tool_search_contracts(ids, query="", contract_type=None, party=None, year=None, limit=20):
+def tool_search_contracts(ids, query="", contract_type=None, party=None, year=None, project=None, limit=20):
     marks, args = _ids_sql(ids)
-    sql = f"SELECT * FROM contracts WHERE id IN {marks}"
+    sql = (f"SELECT contracts.*, projects.name project_name, projects.code project_code FROM contracts "
+           f"LEFT JOIN projects ON projects.id=contracts.project_id WHERE contracts.id IN {marks}")
+    if project:
+        sql += " AND lower(coalesce(projects.name,'')||' '||coalesce(projects.code,'')) LIKE ?"
+        args.append(f"%{str(project).lower()}%")
     for w in (query or "").split():
         like = f"%{w.lower()}%"
         sql += (" AND (coalesce(search_text,'') LIKE ?"
-                " OR id IN (SELECT contract_id FROM pages WHERE lower(redacted_text) LIKE ?))")
+                " OR contracts.id IN (SELECT contract_id FROM pages WHERE lower(redacted_text) LIKE ?))")
         args += [like, like]
     if contract_type:
         sql += " AND contract_type=?"
@@ -159,8 +164,8 @@ def tool_search_contracts(ids, query="", contract_type=None, party=None, year=No
     if year:
         sql += " AND substr(coalesce(signing_date, effective_date, start_date, uploaded_at),1,4)=?"
         args.append(str(year))
-    rows = db.q(sql + " ORDER BY id DESC LIMIT ?", args + [min(int(limit or 20), 50)])
-    return [{"id": r["id"], "contract_no": r["contract_no"], "title": r["title"], "title_zh": r["title_zh"],
+    rows = db.q(sql + " ORDER BY contracts.id DESC LIMIT ?", args + [min(int(limit or 20), 50)])
+    return [{"id": r["id"], "contract_no": r["contract_no"], "project": r["project_name"], "title": r["title"], "title_zh": r["title_zh"],
              "party_a": r["party_a"], "party_b": r["party_b"], "type": r["contract_type"],
              "total_amount": r["total_amount"], "currency": r["currency"], "signing_date": r["signing_date"],
              "review_status": "confirmed by a human reviewer" if r["status"] == "confirmed" else "AI-extracted, not yet reviewed",
@@ -181,7 +186,8 @@ def tool_get_contract(ids, contract_id, sections=None):
     r = db.q("SELECT * FROM contracts WHERE id=?", (contract_id,), one=True)
     data = json.loads(r["data_json"]) if r.get("data_json") else {}
     keys = [k for s in (sections or SECTION_KEYS) for k in SECTION_KEYS.get(s, [])]
-    out = {"id": r["id"], "contract_no": r["contract_no"], "file_name": r["file_name"], "pages": r["page_count"],
+    proj = db.q("SELECT name FROM projects WHERE id=?", (r["project_id"],), one=True) if r.get("project_id") else None
+    out = {"id": r["id"], "contract_no": r["contract_no"], "project": proj and proj["name"], "file_name": r["file_name"], "pages": r["page_count"],
            "review_status": "confirmed by a human reviewer" if r["status"] == "confirmed" else "AI-extracted, not yet reviewed",
            "contract_status": r["lifecycle_status"], "notes": r["notes"]}
     for k in keys:

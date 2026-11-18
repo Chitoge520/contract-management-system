@@ -23,13 +23,14 @@ PERMISSIONS = [
     "contract.download",     # download the original file
     "contract.export",       # export to Excel
     "payment.record",        # record payment of a payment node, add / remove proof files
+    "project.manage",        # create, rename and delete projects
     "ai.use",                # use the AI assistant
     "audit.view",            # view the audit log
 ]
 BUILTIN_ROLES = {
     "admin": ("管理员", PERMISSIONS),
     "editor": ("编辑", ["contract.upload", "contract.edit", "contract.review", "contract.reprocess",
-                        "contract.assign_dept", "contract.download", "contract.export", "payment.record", "ai.use",
+                        "contract.assign_dept", "contract.download", "contract.export", "payment.record", "project.manage", "ai.use",
                         "audit.view"]),
     "viewer": ("只读", ["contract.download", "contract.export", "ai.use", "audit.view"]),
 }
@@ -138,11 +139,24 @@ def user_count():
     return db.q("SELECT count(*) n FROM users", one=True)["n"]
 
 
+def _username_from_employee_no(employee_no):
+    """People sign in with their employee ID; the internal user name is derived from it (kept unique)."""
+    base, n = employee_no, 1
+    name = base
+    while db.q("SELECT 1 FROM users WHERE lower(username)=lower(?)", (name,), one=True):
+        n += 1
+        name = f"{base}-{n}"
+    return name
+
+
 def create_user(username, password, role="viewer", display_name=None, employee_no=None, status="active"):
-    username = (username or "").strip()
-    validate_username(username)
     employee_no = normalize_employee_no(employee_no)
     validate_employee_no(employee_no)
+    username = (username or "").strip()
+    if username:  # still accepted from older clients / scripts
+        validate_username(username)
+    else:
+        username = _username_from_employee_no(employee_no)
     if not db.q("SELECT 1 FROM roles WHERE key=?", (role,), one=True):
         raise HTTPException(400, "Invalid role")
     validate_password(password)
@@ -150,6 +164,16 @@ def create_user(username, password, role="viewer", display_name=None, employee_n
                 "VALUES (?,?,?,?,1,?,?,?)",
                 (username, (display_name or "").strip() or username, hash_password(password), role, db.now(), employee_no, status))
     return db.q("SELECT * FROM users WHERE id=?", (uid,), one=True)
+
+
+def find_login(account):
+    """The user who signs in with this employee ID (any letter case). The employee ID always wins; the old user name
+    still works as long as it is nobody's employee ID, so people who are used to it are not locked out."""
+    account = (account or "").strip()
+    if not account:
+        return None
+    return db.q("SELECT * FROM users WHERE lower(employee_no)=lower(?)", (account,), one=True) \
+        or db.q("SELECT * FROM users WHERE lower(username)=lower(?)", (account,), one=True)
 
 
 # ---------------- sessions ----------------

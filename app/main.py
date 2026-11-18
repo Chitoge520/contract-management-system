@@ -137,20 +137,21 @@ def auth_setup(request: Request, response: Response, body: dict = Body(...)):
 
 @app.post("/api/auth/login")
 def login(request: Request, response: Response, body: dict = Body(...)):
-    name = (body.get("username") or "").strip()
+    # people sign in with their employee ID ("account"); "username" is accepted from older pages
+    name = (body.get("account") or body.get("username") or "").strip()
     ip = _client_ip(request)
     # lock per IP and per account-from-that-IP, so nobody can lock a real user out from elsewhere
     keys = ("ip:" + ip, "user:" + name.lower() + "@" + ip)
     _check_locked(*keys)
     _require_captcha(body)
-    u = db.q("SELECT * FROM users WHERE lower(username)=lower(?)", (name,), one=True)
+    u = auth.find_login(name)
     if u and u.get("status") == "pending" and auth.check_password(body.get("password") or "", u["password_hash"]):
         raise HTTPException(403, "账号正在等待管理员审核，审核通过后才能登录 / Your account is waiting for administrator approval")
     if not u or not u["active"] or u.get("status") != "active" \
             or not auth.check_password(body.get("password") or "", u["password_hash"]):
         _record_fail(*keys)
         auth.log(None, "login_failed", detail={"username": name, "ip": _client_ip(request)})
-        raise HTTPException(401, "用户名或密码错误 / Wrong username or password")
+        raise HTTPException(401, "工号或密码错误 / Wrong employee ID or password")
     for k in keys:
         _FAILS.pop(k, None)
     db.ex("UPDATE users SET last_login=? WHERE id=?", (db.now(), u["id"]))
@@ -546,7 +547,7 @@ def _hits(cid, data, words):
 YEAR_SQL = "substr(coalesce(contracts.signing_date, contracts.effective_date, contracts.start_date, contracts.uploaded_at),1,4)"
 
 
-def _contract_filter(user, q="", type="", party="", status="", lifecycle="", year="", dept=""):
+def _contract_filter(user, q="", type="", party="", status="", lifecycle="", year="", dept="", project=""):
     """WHERE clause (and args) for the contract list and the Excel export, limited to what the user may see."""
     cond, args = access.visible_sql(user, "contracts")
     sql = cond
@@ -578,7 +579,17 @@ def _contract_filter(user, q="", type="", party="", status="", lifecycle="", yea
     if year:
         sql += f" AND {YEAR_SQL}=?"
         args.append(str(year))
+    if project == "none":
+        sql += " AND contracts.project_id IS NULL"
+    elif project:
+        if not str(project).isdigit():
+            raise HTTPException(400, "Invalid project")
+        sql += " AND contracts.project_id=?"
+        args.append(int(project))
     return sql, args
+
+
+PROJECT_NAME_SQL = "(SELECT name FROM projects WHERE projects.id=contracts.project_id) AS project_name"
 
 
 CONTRACT_ORDER = f" ORDER BY {YEAR_SQL} DESC, contracts.id DESC"
@@ -586,11 +597,11 @@ CONTRACT_ORDER = f" ORDER BY {YEAR_SQL} DESC, contracts.id DESC"
 
 @app.get("/api/contracts")
 def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "", lifecycle: str = "", year: str = "",
-                   dept: str = "", page: int = 0, page_size: int = 0, user=Depends(current_user)):
+                   dept: str = "", project: str = "", page: int = 0, page_size: int = 0, user=Depends(current_user)):
     """Newest year first. With page_size the answer is one page: {"total", "page", "page_size", "rows"};
     without it, the whole list (used by the AI assistant's contract picker)."""
-    where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept)
-    sql = f"SELECT contracts.*, {YEAR_SQL} AS year FROM contracts WHERE {where}{CONTRACT_ORDER}"
+    where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept, project)
+    sql = f"SELECT contracts.*, {YEAR_SQL} AS year, {PROJECT_NAME_SQL} FROM contracts WHERE {where}{CONTRACT_ORDER}"
     total = None
     if page_size > 0:
         page_size = min(page_size, 200)
@@ -654,6 +665,8 @@ def get_contract(cid: int, user=Depends(current_user)):
     row = _list_row(row)
     row["data"] = data
     row["departments"] = access.departments_of(cid)
+    p = db.q("SELECT id, name, code FROM projects WHERE id=?", (row.get("project_id"),), one=True) if row.get("project_id") else None
+    row["project"] = p
     return row
 
 
@@ -755,6 +768,102 @@ def stats(user=Depends(current_user)):
     return {"by_status": by_status, "parties": parties, "years": years, "count": sum(by_status.values())}
 
 
+# ================= projects =================
+def _project_body(body, current=None):
+    name = (body.get("name") if "name" in body else (current or {}).get("name") or "")
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(400, "项目名称不能为空 / Project name required")
+    if len(name) > 100:
+        raise HTTPException(400, "项目名称最多 100 字 / Project name: at most 100 characters")
+    dup = db.q("SELECT id FROM projects WHERE lower(name)=lower(?)", (name,), one=True)
+    if dup and (not current or dup["id"] != current["id"]):
+        raise HTTPException(400, "已有同名项目 / A project with this name already exists")
+    code = (body.get("code") if "code" in body else (current or {}).get("code")) or None
+    note = (body.get("note") if "note" in body else (current or {}).get("note")) or None
+    return name, (code.strip()[:50] or None) if code else None, (note.strip()[:500] or None) if note else None
+
+
+def _project(pid):
+    p = db.q("SELECT * FROM projects WHERE id=?", (pid,), one=True)
+    if not p:
+        raise HTTPException(404, "Project not found")
+    return p
+
+
+@app.get("/api/projects")
+def list_projects(user=Depends(current_user)):
+    """Every project, with figures over the contracts this user may see: contracts, contract value per currency,
+    payment progress (complete payments / nodes) and overdue nodes."""
+    cond, args = access.visible_sql(user, "contracts")
+    ok = payments.paid_sql("p")
+    today = payments.today()
+    stats = {r["project_id"]: r for r in db.q(
+        f"SELECT contracts.project_id, count(DISTINCT contracts.id) contracts, count(p.id) nodes, coalesce(sum({ok}), 0) paid, "
+        f"coalesce(sum(NOT {ok} AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date<?), 0) overdue "
+        f"FROM contracts LEFT JOIN payments p ON p.contract_id=contracts.id "
+        f"WHERE contracts.project_id IS NOT NULL AND {cond} GROUP BY contracts.project_id", [today] + args)}
+    values = {}
+    for r in db.q(f"SELECT project_id, currency, sum(total_amount) total FROM contracts WHERE project_id IS NOT NULL "
+                  f"AND total_amount IS NOT NULL AND {cond} GROUP BY project_id, currency ORDER BY currency", args):
+        values.setdefault(r["project_id"], []).append({"currency": r["currency"] or "", "total": round(r["total"], 2)})
+    out = []
+    for p in db.q("SELECT * FROM projects ORDER BY name COLLATE NOCASE"):
+        s = stats.get(p["id"]) or {}
+        out.append(dict(p, contracts=s.get("contracts", 0), nodes=s.get("nodes", 0), paid=s.get("paid", 0),
+                        overdue=s.get("overdue", 0), values=values.get(p["id"], [])))
+    none = db.q(f"SELECT count(*) n FROM contracts WHERE project_id IS NULL AND {cond}", args, one=True)["n"]
+    return {"projects": out, "without_project": none}
+
+
+@app.post("/api/projects")
+def add_project(body: dict = Body(...), user=Depends(require("project.manage"))):
+    name, code, note = _project_body(body)
+    pid = db.ex("INSERT INTO projects (name, code, note, created_at, created_by) VALUES (?,?,?,?,?)",
+                (name, code, note, db.now(), _name(user)))
+    auth.log(user, "project_create", detail={"name": name, "code": code})
+    return _project(pid)
+
+
+@app.put("/api/projects/{pid}")
+def update_project(pid: int, body: dict = Body(...), user=Depends(require("project.manage"))):
+    p = _project(pid)
+    name, code, note = _project_body(body, p)
+    db.ex("UPDATE projects SET name=?, code=?, note=? WHERE id=?", (name, code, note, pid))
+    changes = {k: [p[k], v] for k, v in (("name", name), ("code", code), ("note", note)) if (p[k] or None) != v}
+    if changes:
+        auth.log(user, "project_update", detail={"name": name, "changes": changes})
+    return _project(pid)
+
+
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: int, user=Depends(require("project.manage"))):
+    p = _project(pid)
+    n = db.q("SELECT count(*) n FROM contracts WHERE project_id=?", (pid,), one=True)["n"]
+    db.ex("DELETE FROM projects WHERE id=?", (pid,))  # its contracts stay, without a project
+    auth.log(user, "project_delete", detail={"name": p["name"], "contracts": n})
+    return {"ok": True, "contracts": n}
+
+
+@app.put("/api/contracts/{cid}/project")
+def set_contract_project(cid: int, body: dict = Body(...), user=Depends(require("contract.edit"))):
+    """Put a contract into a project (or none). Does not change its review status."""
+    row = _get(cid, user)
+    pid = body.get("project_id") or None
+    if pid is not None:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Invalid project")
+        _project(pid)
+    if pid != row.get("project_id"):
+        old = db.q("SELECT name FROM projects WHERE id=?", (row.get("project_id"),), one=True) if row.get("project_id") else None
+        db.ex("UPDATE contracts SET project_id=?, updated_at=?, updated_by=? WHERE id=?", (pid, db.now(), _name(user), cid))
+        new = _project(pid)["name"] if pid else None
+        auth.log(user, "project", cid, {"old": old and old["name"], "new": new})
+    return get_contract(cid, user)
+
+
 # ================= payments =================
 pay_user = require("payment.record")
 
@@ -842,11 +951,11 @@ def delete_payment_file(fid: int, user=Depends(pay_user)):
 
 
 @app.get("/api/payments/contracts")
-def payment_contracts(status: str = "pending", q: str = "", year: str = "", page: int = 1, page_size: int = 20,
-                      user=Depends(current_user)):
+def payment_contracts(status: str = "pending", q: str = "", year: str = "", project: str = "", page: int = 1,
+                      page_size: int = 20, user=Depends(current_user)):
     """Payment tracking grouped by contract: one row per contract that has payment nodes.
     status: pending (something left to pay) / overdue / due30 / incomplete / paid (everything paid) / "" (all)."""
-    where, args = _contract_filter(user, year=year)
+    where, args = _contract_filter(user, year=year, project=project)
     for word in q.split():
         like = f"%{word.lower()}%"
         where += (" AND (coalesce(contracts.search_text,'') LIKE ? OR contracts.id IN (SELECT contract_id FROM payments "
@@ -864,7 +973,8 @@ def payment_contracts(status: str = "pending", q: str = "", year: str = "", page
               "paid": "paid = nodes"}.get(status, "1=1")
     total = db.q(f"SELECT count(*) n FROM ({grouped}) g WHERE {having}", gargs, one=True)["n"]
     page_size, page = min(max(page_size, 1), 100), max(page, 1)
-    rows = db.q(f"SELECT g.*, c.contract_no, c.title, c.title_zh, c.party_b, c.currency FROM ({grouped}) g "
+    rows = db.q(f"SELECT g.*, c.contract_no, c.title, c.title_zh, c.party_b, c.currency, "
+                f"(SELECT name FROM projects WHERE projects.id=c.project_id) project_name FROM ({grouped}) g "
                 f"JOIN contracts c ON c.id=g.contract_id WHERE {having} "
                 f"ORDER BY g.overdue > 0 DESC, g.next_due IS NULL, g.next_due, g.contract_id DESC LIMIT ? OFFSET ?",
                 gargs + [page_size, (page - 1) * page_size])
@@ -890,10 +1000,10 @@ def payment_contracts(status: str = "pending", q: str = "", year: str = "", page
 
 
 @app.get("/api/payments")
-def payment_tracking(status: str = "", q: str = "", year: str = "", page: int = 1, page_size: int = 20,
-                     user=Depends(current_user)):
+def payment_tracking(status: str = "", q: str = "", year: str = "", project: str = "", page: int = 1,
+                     page_size: int = 20, user=Depends(current_user)):
     """Payment nodes of every contract the user may see. status: pending / paid / overdue / due30 (due in 30 days)."""
-    where, args = _contract_filter(user, year=year)
+    where, args = _contract_filter(user, year=year, project=project)
     sql = f"FROM payments p JOIN contracts ON contracts.id=p.contract_id WHERE {where}"
     today = payments.today()
     ok = payments.paid_sql("p")
@@ -939,7 +1049,7 @@ def _xlsx_safe(v):
 
 @app.get("/api/export.xlsx")
 def export_xlsx(ids: str = "", q: str = "", type: str = "", party: str = "", status: str = "", lifecycle: str = "",
-                year: str = "", dept: str = "", user=Depends(require("contract.export"))):
+                year: str = "", dept: str = "", project: str = "", user=Depends(require("contract.export"))):
     """Export the given ids, or else every contract matching the list filters (all pages, not just the one shown)."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -950,8 +1060,9 @@ def export_xlsx(ids: str = "", q: str = "", type: str = "", party: str = "", sta
         rows = [db.q("SELECT * FROM contracts WHERE id=?", (i,), one=True) for i in id_list]
         rows = [r for r in rows if r]
     else:
-        where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept)
+        where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept, project)
         rows = db.q(f"SELECT contracts.* FROM contracts WHERE {where}{CONTRACT_ORDER}", args)
+    names = {p["id"]: p["name"] for p in db.q("SELECT id, name FROM projects")}
     auth.log(user, "export", detail={"contracts": len(rows)})
     wb = Workbook()
     head_font = Font(bold=True, color="FFFFFF")
@@ -973,17 +1084,17 @@ def export_xlsx(ids: str = "", q: str = "", type: str = "", party: str = "", sta
     data = []
     for r in rows:
         d = json.loads(r["data_json"]) if r.get("data_json") else {}
-        data.append([r["id"], r["contract_no"], r["title"], r["title_zh"], r["contract_type"], r["party_a"], r["party_b"],
+        data.append([r["id"], r["contract_no"], names.get(r.get("project_id")), r["title"], r["title_zh"], r["contract_type"], r["party_a"], r["party_b"],
                      r["signing_date"], r["effective_date"], r["start_date"], r["end_date"],
                      (d.get("basic") or {}).get("term_text"), r["currency"], r["total_amount"],
                      (d.get("amount") or {}).get("settlement_currency"), r["status"], r["lifecycle_status"],
                      r.get("uploaded_by"), r.get("confirmed_by"), r.get("confirmed_at"),
                      d.get("summary_zh"), r["file_name"]])
-    sheet(ws, ["ID", "合同号 No.", "名称 Title", "中文名称", "类型 Type", "甲方 Party A", "乙方 Party B", "签署日期 Signed",
+    sheet(ws, ["ID", "合同号 No.", "项目 Project", "名称 Title", "中文名称", "类型 Type", "甲方 Party A", "乙方 Party B", "签署日期 Signed",
                "生效日期 Effective", "开始 Start", "结束 End", "期限 Term", "币种 Currency", "总金额 Total",
                "结算币种 Settlement", "处理状态 Status", "合同状态 Lifecycle", "上传人 Uploaded by", "复核人 Reviewed by",
                "复核时间 Reviewed at", "中文摘要 Summary", "文件 File"],
-          data, [6, 18, 40, 30, 10, 30, 30, 12, 12, 12, 12, 30, 8, 14, 10, 10, 10, 12, 12, 18, 60, 40])
+          data, [6, 18, 24, 40, 30, 10, 30, 30, 12, 12, 12, 12, 30, 8, 14, 10, 10, 10, 12, 12, 18, 60, 40])
 
     ws2 = wb.create_sheet("明细 Line items")
     data = []
