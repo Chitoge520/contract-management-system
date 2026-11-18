@@ -268,3 +268,17 @@ mark { background: #FFE9A8; }
   .ai-side { display: none; }
   .examples { grid-template-columns: 1fr; }
 }
+
+/* registration */
+.auth-card .el-form-item { margin-bottom: 14px; }
+.rules { display: flex; gap: 12px; flex-wrap: wrap; width: 100%; }
+.rule { font-size: 12px; line-height: 1.6; color: var(--ink-3); width: auto; }
+.el-form-item__content > .rule { width: 100%; }
+.rule.ok { color: var(--green); }
+.rule.bad { color: var(--red); }
+.auth-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; gap: 10px; flex-wrap: wrap; }
+.auth-foot .lang-link { margin-top: 0; }
+.tab-badge { margin-left: 6px; vertical-align: 1px; }
+.tab-badge .el-badge__content { border: 0; }
+.nav-badge { margin-left: auto; }
+.nav-badge .el-badge__content { border: 0; }

@@ -102,7 +102,7 @@ def auth_state(request: Request):
 def auth_setup(request: Request, response: Response, body: dict = Body(...)):
     if auth.user_count() > 0:
         raise HTTPException(400, "Already set up")
-    u = auth.create_user(body.get("username"), body.get("password"), "admin", body.get("display_name"))
+    u = auth.create_user(body.get("username"), body.get("password"), "admin", body.get("display_name"), body.get("employee_no"))
     auth.log(u, "setup")
     _set_cookie(request, response, auth.new_session(u["id"]))
     return {"user": auth.public_user(u)}
@@ -116,7 +116,10 @@ def login(request: Request, response: Response, body: dict = Body(...)):
     keys = ("ip:" + ip, "user:" + name.lower() + "@" + ip)
     _check_locked(*keys)
     u = db.q("SELECT * FROM users WHERE lower(username)=lower(?)", (name,), one=True)
-    if not u or not u["active"] or not auth.check_password(body.get("password") or "", u["password_hash"]):
+    if u and u.get("status") == "pending" and auth.check_password(body.get("password") or "", u["password_hash"]):
+        raise HTTPException(403, "账号正在等待管理员审核，审核通过后才能登录 / Your account is waiting for administrator approval")
+    if not u or not u["active"] or u.get("status") != "active" \
+            or not auth.check_password(body.get("password") or "", u["password_hash"]):
         _record_fail(*keys)
         auth.log(None, "login_failed", detail={"username": name, "ip": _client_ip(request)})
         raise HTTPException(401, "用户名或密码错误 / Wrong username or password")
@@ -126,6 +129,35 @@ def login(request: Request, response: Response, body: dict = Body(...)):
     auth.log(u, "login", detail={"ip": _client_ip(request)})
     _set_cookie(request, response, auth.new_session(u["id"]))
     return {"user": auth.public_user(u)}
+
+
+_REG = {}
+REG_PER_IP_HOUR, MAX_PENDING = 5, 50
+
+
+@app.post("/api/auth/register")
+def register(request: Request, body: dict = Body(...)):
+    import time
+    if auth.user_count() == 0:
+        raise HTTPException(400, "系统尚未初始化 / Not set up yet")
+    ip = _client_ip(request)
+    now = time.time()
+    recent = [t for t in _REG.get(ip, []) if now - t < 3600]
+    if len(recent) >= REG_PER_IP_HOUR:
+        raise HTTPException(429, "注册次数过多，请稍后再试 / Too many registrations, try again later")
+    pending = db.q("SELECT count(*) n FROM users WHERE status='pending'", one=True)["n"]
+    if pending >= MAX_PENDING:
+        raise HTTPException(429, "待审核的申请太多，请联系管理员 / Too many pending requests, contact the administrator")
+    if body.get("password") != body.get("password2", body.get("password")):
+        raise HTTPException(400, "两次输入的密码不一致 / Passwords do not match")
+    if not (body.get("display_name") or "").strip():
+        raise HTTPException(400, "请填写姓名 / Name required")
+    u = auth.create_user(body.get("username"), body.get("password"), "viewer", body.get("display_name"),
+                         body.get("employee_no"), status="pending")
+    _REG[ip] = recent + [now]
+    auth.log(None, "register", detail={"username": u["username"], "employee_no": u["employee_no"],
+                                       "name": u["display_name"], "ip": ip})
+    return {"ok": True, "status": "pending"}
 
 
 @app.post("/api/auth/logout")
@@ -150,18 +182,57 @@ def change_password(body: dict = Body(...), user=Depends(current_user)):
 # ================= users (admin) =================
 @app.get("/api/users")
 def list_users(user=Depends(admin)):
-    return [auth.public_user(u) for u in db.q("SELECT * FROM users ORDER BY id")]
+    return [auth.public_user(u) for u in db.q("SELECT * FROM users WHERE status='active' ORDER BY id")]
+
+
+@app.get("/api/users/pending")
+def pending_users(user=Depends(admin)):
+    return [auth.public_user(u) for u in db.q("SELECT * FROM users WHERE status='pending' ORDER BY id")]
+
+
+@app.get("/api/users/pending/count")
+def pending_count(user=Depends(admin)):
+    return {"count": db.q("SELECT count(*) n FROM users WHERE status='pending'", one=True)["n"]}
+
+
+@app.post("/api/users/{uid}/approve")
+def approve_user(uid: int, body: dict = Body(default={}), user=Depends(admin)):
+    u = db.q("SELECT * FROM users WHERE id=? AND status='pending'", (uid,), one=True)
+    if not u:
+        raise HTTPException(404, "Request not found")
+    role_key = (body or {}).get("role") or "viewer"
+    if not auth.role(role_key):
+        raise HTTPException(400, "Invalid role")
+    dept_id = (body or {}).get("department_id") or None
+    if dept_id and not access.department(dept_id):
+        raise HTTPException(400, "Department not found")
+    db.ex("UPDATE users SET status='active', role=?, department_id=?, position=? WHERE id=?",
+          (role_key, dept_id, (body or {}).get("position") or None, uid))
+    auth.log(user, "user_approve", detail={"username": u["username"], "employee_no": u["employee_no"],
+                                           "role": role_key, "department": (access.department(dept_id) or {}).get("name")})
+    return auth.public_user(db.q("SELECT * FROM users WHERE id=?", (uid,), one=True))
+
+
+@app.post("/api/users/{uid}/reject")
+def reject_user(uid: int, user=Depends(admin)):
+    u = db.q("SELECT * FROM users WHERE id=? AND status='pending'", (uid,), one=True)
+    if not u:
+        raise HTTPException(404, "Request not found")
+    db.ex("DELETE FROM users WHERE id=?", (uid,))
+    auth.log(user, "user_reject", detail={"username": u["username"], "employee_no": u["employee_no"]})
+    return {"ok": True}
 
 
 @app.post("/api/users")
 def add_user(body: dict = Body(...), user=Depends(admin)):
-    u = auth.create_user(body.get("username"), body.get("password"), body.get("role") or "viewer", body.get("display_name"))
+    u = auth.create_user(body.get("username"), body.get("password"), body.get("role") or "viewer", body.get("display_name"),
+                         body.get("employee_no"))
     dept_id = body.get("department_id") or None
     if dept_id and not access.department(dept_id):
         raise HTTPException(400, "Department not found")
     db.ex("UPDATE users SET department_id=?, position=? WHERE id=?", (dept_id, body.get("position") or None, u["id"]))
     u = db.q("SELECT * FROM users WHERE id=?", (u["id"],), one=True)
-    auth.log(user, "user_create", detail={"username": u["username"], "role": u["role"],
+    auth.log(user, "user_create", detail={"username": u["username"], "role": u["role"], "employee_no": u["employee_no"],
                                           "department": (access.department(dept_id) or {}).get("name"),
                                           "position": u["position"]})
     return auth.public_user(u)
@@ -169,7 +240,7 @@ def add_user(body: dict = Body(...), user=Depends(admin)):
 
 @app.put("/api/users/{uid}")
 def update_user(uid: int, body: dict = Body(...), user=Depends(admin)):
-    u = db.q("SELECT * FROM users WHERE id=?", (uid,), one=True)
+    u = db.q("SELECT * FROM users WHERE id=? AND status='active'", (uid,), one=True)
     if not u:
         raise HTTPException(404, "User not found")
     changes = {}
@@ -185,6 +256,10 @@ def update_user(uid: int, body: dict = Body(...), user=Depends(admin)):
         if body["department_id"] and not access.department(body["department_id"]):
             raise HTTPException(400, "Department not found")
         changes["department_id"] = [u.get("department_id"), body["department_id"] or None]
+    if "employee_no" in body and auth.normalize_employee_no(body["employee_no"]) != (u.get("employee_no") or ""):
+        new_no = auth.normalize_employee_no(body["employee_no"])
+        auth.validate_employee_no(new_no, exclude_user_id=uid)
+        changes["employee_no"] = [u.get("employee_no"), new_no]
     if "position" in body and (body["position"] or "") != (u.get("position") or ""):
         changes["position"] = [u.get("position"), body["position"] or None]
     for k in ("ai_daily_questions", "ai_daily_tokens"):

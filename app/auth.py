@@ -77,6 +77,13 @@ def init():
         for col in ("uploaded_by", "updated_by", "confirmed_by"):
             if col not in cols:
                 c.execute(f"ALTER TABLE contracts ADD COLUMN {col} TEXT")
+        ucols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
+        if "status" not in ucols:      # active / pending (self-registered, waiting for an admin)
+            c.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        if "employee_no" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN employee_no TEXT")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_no ON users(employee_no COLLATE NOCASE) "
+                  "WHERE employee_no IS NOT NULL")
         for key, (name, perms) in BUILTIN_ROLES.items():
             if not c.execute("SELECT 1 FROM roles WHERE key=?", (key,)).fetchone():
                 c.execute("INSERT INTO roles (key, name, permissions, builtin, created_at) VALUES (?,?,?,1,?)",
@@ -130,12 +137,40 @@ def validate_password(pw: str):
                                  "Password needs at least 10 characters with both letters and digits")
 
 
+# ---------------- field rules ----------------
+import re as _re
+USERNAME_RE = _re.compile(r"^[A-Za-z0-9]{3,32}$")
+EMPLOYEE_NO_RE = _re.compile(r"^[A-Za-z0-9-]{1,32}$")
+
+
+def validate_username(name: str):
+    if not USERNAME_RE.match(name or ""):
+        raise HTTPException(400, "用户名只能包含英文字母和数字，长度 3-32 位，不能有空格或特殊字符 / "
+                                 "Username: 3-32 letters or digits only, no spaces or symbols")
+    if db.q("SELECT 1 FROM users WHERE lower(username)=lower(?)", (name,), one=True):
+        raise HTTPException(400, "用户名已被使用 / Username already taken")
+
+
+def normalize_employee_no(no):
+    return (no or "").strip()
+
+
+def validate_employee_no(no: str, exclude_user_id=None):
+    if not EMPLOYEE_NO_RE.match(no or ""):
+        raise HTTPException(400, "工号必填，只能包含字母、数字和“-”，最长 32 位 / "
+                                 "Employee ID is required: letters, digits and '-' only, max 32")
+    row = db.q("SELECT id FROM users WHERE lower(employee_no)=lower(?)", (no,), one=True)
+    if row and row["id"] != exclude_user_id:
+        raise HTTPException(400, "该工号已存在 / This employee ID already exists")
+
+
 # ---------------- users ----------------
 def public_user(u):
     if not u:
         return None
     out = {k: u.get(k) for k in ("id", "username", "display_name", "role", "active", "created_at", "last_login",
-                                  "department_id", "position", "ai_daily_questions", "ai_daily_tokens")}
+                                  "department_id", "position", "ai_daily_questions", "ai_daily_tokens",
+                                  "employee_no", "status")}
     dept = db.q("SELECT name, see_all FROM departments WHERE id=?", (u.get("department_id"),), one=True) \
         if u.get("department_id") else None
     out["department_name"] = dept["name"] if dept else None
@@ -150,17 +185,17 @@ def user_count():
     return db.q("SELECT count(*) n FROM users", one=True)["n"]
 
 
-def create_user(username, password, role="viewer", display_name=None):
+def create_user(username, password, role="viewer", display_name=None, employee_no=None, status="active"):
     username = (username or "").strip()
-    if not username:
-        raise HTTPException(400, "用户名不能为空 / Username required")
+    validate_username(username)
+    employee_no = normalize_employee_no(employee_no)
+    validate_employee_no(employee_no)
     if not db.q("SELECT 1 FROM roles WHERE key=?", (role,), one=True):
         raise HTTPException(400, "Invalid role")
     validate_password(password)
-    if db.q("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,), one=True):
-        raise HTTPException(400, "用户名已存在 / Username already exists")
-    uid = db.ex("INSERT INTO users (username, display_name, password_hash, role, active, created_at) VALUES (?,?,?,?,1,?)",
-                (username, display_name or username, hash_password(password), role, db.now()))
+    uid = db.ex("INSERT INTO users (username, display_name, password_hash, role, active, created_at, employee_no, status) "
+                "VALUES (?,?,?,?,1,?,?,?)",
+                (username, (display_name or "").strip() or username, hash_password(password), role, db.now(), employee_no, status))
     return db.q("SELECT * FROM users WHERE id=?", (uid,), one=True)
 
 
@@ -181,7 +216,7 @@ def current_user(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if token:
         row = db.q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id "
-                   "WHERE s.token=? AND s.expires_at>=? AND u.active=1", (token, db.now()), one=True)
+                   "WHERE s.token=? AND s.expires_at>=? AND u.active=1 AND u.status='active'", (token, db.now()), one=True)
         if row:
             return row
     raise HTTPException(401, "请先登录 / Please sign in")

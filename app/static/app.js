@@ -6,7 +6,7 @@ const { ElMessage, ElMessageBox } = ElementPlus;
 const store = reactive({
   lang: (() => { try { return localStorage.getItem('cms_lang') || 'zh'; } catch (e) { return 'zh'; } })(),
   route: { name: 'list', id: null, query: {} },
-  user: null, needsSetup: false, authChecked: false,
+  user: null, needsSetup: false, authChecked: false, pendingCount: 0,
 });
 function t(k, vars) {
   let s = (I18N[store.lang] && I18N[store.lang][k]) || I18N.zh[k] || k;
@@ -18,7 +18,7 @@ const STATUSES = ['queued', 'reading', 'extracting', 'review', 'confirmed', 'fai
 const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
 const ROLES = ['admin', 'editor', 'viewer'];
-const ACTIONS = ['ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
+const ACTIONS = ['register', 'user_approve', 'user_reject', 'ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
   'lifecycle_status', 'notes', 'login', 'login_failed', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
 // permission check: 'admin' = administrators; otherwise a permission key such as 'contract.upload'
 const can = p => !!store.user && (p === 'admin' ? store.user.role === 'admin' : (store.user.permissions || []).includes(p));
@@ -132,10 +132,14 @@ const AuditDetail = {
       if (r.action === 'lifecycle_status') return t('l_' + (d.old || 'active')) + ' → ' + t('l_' + d.new);
       if (r.action === 'notes') return showVal(d.new);
       if (r.action === 'user_create') return d.username + ' (' + roleName(d.role) + (d.department ? ' · ' + d.department : '') + ')';
+      if (r.action === 'register') return d.name + ' · ' + d.username + ' · ' + t('employeeNo') + ' ' + d.employee_no + (d.ip ? ' · IP ' + d.ip : '');
+      if (r.action === 'user_approve') return d.username + ' → ' + roleName(d.role) + (d.department ? ' · ' + d.department : '');
+      if (r.action === 'user_reject') return d.username + ' · ' + t('employeeNo') + ' ' + d.employee_no;
       if (r.action === 'user_update') return d.username + ': ' + Object.entries(d.changes || {}).map(([k, v]) =>
         k === 'role' ? t('role') + ' ' + roleName(v[0]) + '→' + roleName(v[1]) :
         k === 'department' ? t('department') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
         k === 'position' ? t('position') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
+        k === 'employee_no' ? t('employeeNo') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
         k === 'active' ? (v[1] ? t('enabled') : t('disabled')) : k === 'password' ? t('resetPw') : k).join(', ');
       if (r.action === 'extracted') return (d.model || '') + (d.items != null ? ' · ' + d.items + ' items' : '');
       if (r.action === 'extract_failed') return d.error;
@@ -209,37 +213,96 @@ const DataTable = {
 const AuthView = {
   mixins: [mixin],
   setup() {
-    const f = reactive({ username: '', password: '', password2: '', display_name: '' });
+    // mode: login | register | done (registration submitted); first run uses the setup form
+    const mode = ref('login');
+    const f = reactive({ username: '', password: '', password2: '', display_name: '', employee_no: '' });
     const busy = ref(false);
+    const rules = computed(() => ({
+      user: /^[A-Za-z0-9]{3,32}$/.test(f.username),
+      len: f.password.length >= 10,
+      letter: /[A-Za-z]/.test(f.password),
+      digit: /\d/.test(f.password),
+      same: !!f.password && f.password === f.password2,
+      emp: /^[A-Za-z0-9-]{1,32}$/.test(f.employee_no.trim()),
+    }));
+    const isForm = computed(() => store.needsSetup || mode.value === 'register');
+    const formOk = computed(() => {
+      const r = rules.value;
+      return r.user && r.len && r.letter && r.digit && r.same && r.emp && !!f.display_name.trim();
+    });
+    function reset() { Object.assign(f, { username: '', password: '', password2: '', display_name: '', employee_no: '' }); }
+    function switchTo(m) { mode.value = m; reset(); }
     async function submit() {
-      if (store.needsSetup && f.password !== f.password2) { ElMessage.error(t('pwMismatch')); return; }
+      if (isForm.value && !formOk.value) { ElMessage.error(t('fixForm')); return; }
       busy.value = true;
       try {
-        const r = store.needsSetup
-          ? await api('/api/auth/setup', { method: 'POST', json: { username: f.username, password: f.password, display_name: f.display_name } })
-          : await api('/api/auth/login', { method: 'POST', json: { username: f.username, password: f.password } });
-        store.user = r.user; store.needsSetup = false;
+        if (store.needsSetup) {
+          const r = await api('/api/auth/setup', { method: 'POST', json: { username: f.username, password: f.password, display_name: f.display_name, employee_no: f.employee_no.trim() } });
+          store.user = r.user; store.needsSetup = false;
+        } else if (mode.value === 'register') {
+          await api('/api/auth/register', { method: 'POST', json: { username: f.username, password: f.password, password2: f.password2, display_name: f.display_name, employee_no: f.employee_no.trim() } });
+          mode.value = 'done';
+        } else {
+          const r = await api('/api/auth/login', { method: 'POST', json: { username: f.username, password: f.password } });
+          store.user = r.user;
+        }
       } catch (e) { ElMessage.error(e.message); }
       busy.value = false;
     }
     function toggleLang() { store.lang = store.lang === 'zh' ? 'en' : 'zh'; try { localStorage.setItem('cms_lang', store.lang); } catch (e) {} }
-    return { f, busy, submit, store, toggleLang };
+    return { mode, f, busy, rules, isForm, formOk, submit, switchTo, store, toggleLang };
   },
   template: `
   <div class="auth-page">
     <div class="auth-card">
       <div class="brand auth-brand"><div class="brand-mark" aria-hidden="true"></div>
         <div><div class="brand-name dark">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
-      <h1>{{ store.needsSetup ? t('setupTitle') : t('loginTitle') }}</h1>
-      <p v-if="store.needsSetup" class="note">{{ t('setupText') }}</p>
-      <el-form label-position="top" @submit.prevent="submit">
-        <el-form-item :label="t('username')"><el-input v-model="f.username" autocomplete="username" autofocus /></el-form-item>
-        <el-form-item v-if="store.needsSetup" :label="t('displayName')"><el-input v-model="f.display_name" /></el-form-item>
-        <el-form-item :label="t('password')"><el-input v-model="f.password" type="password" show-password autocomplete="current-password" /></el-form-item>
-        <el-form-item v-if="store.needsSetup" :label="t('passwordAgain')"><el-input v-model="f.password2" type="password" show-password /></el-form-item>
-        <el-button type="primary" size="large" class="w100" :loading="busy" native-type="submit">{{ store.needsSetup ? t('setupBtn') : t('login') }}</el-button>
-      </el-form>
-      <button class="lang-link" type="button" @click="toggleLang">{{ t('lang') }}</button>
+
+      <template v-if="mode === 'done' && !store.needsSetup">
+        <el-result icon="success" :title="t('regDoneTitle')" :sub-title="t('regDoneText')">
+          <template #extra><el-button type="primary" @click="switchTo('login')">{{ t('backToLogin') }}</el-button></template>
+        </el-result>
+      </template>
+
+      <template v-else>
+        <h1>{{ store.needsSetup ? t('setupTitle') : mode === 'register' ? t('registerTitle') : t('loginTitle') }}</h1>
+        <p v-if="store.needsSetup" class="note">{{ t('setupText') }}</p>
+        <p v-else-if="mode === 'register'" class="note">{{ t('registerText') }}</p>
+        <el-form label-position="top" @submit.prevent="submit">
+          <el-form-item :label="t('username')">
+            <el-input v-model="f.username" autocomplete="username" autofocus maxlength="32" />
+            <div v-if="isForm" class="rule" :class="{ ok: rules.user, bad: f.username && !rules.user }">{{ rules.user ? '✓' : '•' }} {{ t('ruleUsername') }}</div>
+          </el-form-item>
+          <template v-if="isForm">
+            <el-form-item :label="t('displayName')"><el-input v-model="f.display_name" maxlength="40" /></el-form-item>
+            <el-form-item :label="t('employeeNo')">
+              <el-input v-model="f.employee_no" maxlength="32" :placeholder="t('employeeNoPh')" />
+              <div class="rule" :class="{ ok: rules.emp, bad: f.employee_no && !rules.emp }">{{ rules.emp ? '✓' : '•' }} {{ t('ruleEmployeeNo') }}</div>
+            </el-form-item>
+          </template>
+          <el-form-item :label="t('password')">
+            <el-input v-model="f.password" type="password" show-password :autocomplete="isForm ? 'new-password' : 'current-password'" />
+            <div v-if="isForm" class="rules">
+              <span class="rule" :class="{ ok: rules.len }">{{ rules.len ? '✓' : '•' }} {{ t('ruleLen') }}</span>
+              <span class="rule" :class="{ ok: rules.letter }">{{ rules.letter ? '✓' : '•' }} {{ t('ruleLetter') }}</span>
+              <span class="rule" :class="{ ok: rules.digit }">{{ rules.digit ? '✓' : '•' }} {{ t('ruleDigit') }}</span>
+            </div>
+          </el-form-item>
+          <el-form-item v-if="isForm" :label="t('passwordAgain')">
+            <el-input v-model="f.password2" type="password" show-password autocomplete="new-password" />
+            <div v-if="f.password2" class="rule" :class="{ ok: rules.same, bad: !rules.same }">{{ rules.same ? '✓ ' + t('pwSame') : '✗ ' + t('pwMismatch') }}</div>
+          </el-form-item>
+          <el-button type="primary" size="large" class="w100" :loading="busy" native-type="submit" :disabled="isForm && !formOk">
+            {{ store.needsSetup ? t('setupBtn') : mode === 'register' ? t('submitRegister') : t('login') }}</el-button>
+        </el-form>
+        <div class="auth-foot">
+          <template v-if="!store.needsSetup">
+            <span v-if="mode === 'login'" class="muted">{{ t('noAccount') }} <a href="javascript:void 0" @click="switchTo('register')">{{ t('registerBtn') }}</a></span>
+            <span v-else class="muted">{{ t('haveAccount') }} <a href="javascript:void 0" @click="switchTo('login')">{{ t('backToLogin') }}</a></span>
+          </template>
+          <button class="lang-link" type="button" @click="toggleLang">{{ t('lang') }}</button>
+        </div>
+      </template>
     </div>
   </div>`,
 };
@@ -882,13 +945,15 @@ const AuditView = {
 const UsersView = {
   mixins: [mixin],
   setup() {
-    const tab = ref(['users', 'roles', 'depts'].includes(store.route.query.tab) ? store.route.query.tab : 'users');
+    const tab = ref(['users', 'pending', 'roles', 'depts'].includes(store.route.query.tab) ? store.route.query.tab : 'users');
     const users = ref([]); const roles = ref([]); const perms = ref([]); const depts = ref([]); const loading = ref(true);
+    const pending = ref([]);
     async function loadAll() {
       loading.value = true;
       try {
-        const [u, r, d] = await Promise.all([api('/api/users'), api('/api/roles'), api('/api/departments')]);
-        users.value = u; roles.value = r.roles; perms.value = r.permissions; depts.value = d;
+        const [u, r, d, p] = await Promise.all([api('/api/users'), api('/api/roles'), api('/api/departments'), api('/api/users/pending')]);
+        users.value = u; roles.value = r.roles; perms.value = r.permissions; depts.value = d; pending.value = p;
+        store.pendingCount = p.length;
         r.roles.forEach(x => { roleNames[x.key] = x.name; });
       } catch (e) { ElMessage.error(e.message); }
       loading.value = false;
@@ -899,19 +964,19 @@ const UsersView = {
 
     // ---- users ----
     const dlg = ref(false); const busy = ref(false);
-    const blank = { id: null, username: '', display_name: '', role: 'viewer', department_id: null, position: '', active: true,
+    const blank = { id: null, username: '', display_name: '', employee_no: '', role: 'viewer', department_id: null, position: '', active: true,
       password: '', ai_daily_questions: null, ai_daily_tokens: null };
     const form = reactive(Object.assign({}, blank));
     function openNew() { Object.assign(form, blank); dlg.value = true; }
     function openEdit(u) {
-      Object.assign(form, blank, { id: u.id, username: u.username, display_name: u.display_name, role: u.role,
+      Object.assign(form, blank, { id: u.id, username: u.username, display_name: u.display_name, employee_no: u.employee_no || '', role: u.role,
         department_id: u.department_id, position: u.position || '', active: !!u.active,
         ai_daily_questions: u.ai_daily_questions, ai_daily_tokens: u.ai_daily_tokens });
       dlg.value = true;
     }
     async function submit() {
       busy.value = true;
-      const body = { display_name: form.display_name, role: form.role, department_id: form.department_id || null,
+      const body = { display_name: form.display_name, employee_no: form.employee_no.trim(), role: form.role, department_id: form.department_id || null,
         position: form.position || null, ai_daily_questions: form.ai_daily_questions, ai_daily_tokens: form.ai_daily_tokens };
       try {
         if (form.id) {
@@ -924,6 +989,20 @@ const UsersView = {
         dlg.value = false; ElMessage.success(t('saved')); loadAll();
       } catch (e) { ElMessage.error(e.message); }
       busy.value = false;
+    }
+
+    // ---- registration requests ----
+    const apDlg = ref(false); const ap = reactive({ id: null, username: '', display_name: '', employee_no: '', role: 'viewer', department_id: null, position: '' });
+    function openApprove(u) { Object.assign(ap, { id: u.id, username: u.username, display_name: u.display_name, employee_no: u.employee_no, role: 'viewer', department_id: null, position: '' }); apDlg.value = true; }
+    async function approve() {
+      try {
+        await api('/api/users/' + ap.id + '/approve', { method: 'POST', json: { role: ap.role, department_id: ap.department_id || null, position: ap.position || null } });
+        apDlg.value = false; ElMessage.success(t('approved')); loadAll();
+      } catch (e) { ElMessage.error(e.message); }
+    }
+    async function reject(u) {
+      try { await ElMessageBox.confirm(t('rejectConfirm', { n: u.display_name + ' (' + u.username + ')' }), t('reject'), { type: 'warning', confirmButtonText: t('reject'), cancelButtonText: t('no') }); } catch (e) { return; }
+      try { await api('/api/users/' + u.id + '/reject', { method: 'POST' }); ElMessage.success(t('rejected')); loadAll(); } catch (e) { ElMessage.error(e.message); }
     }
 
     // ---- roles: permission matrix, every tick saves immediately ----
@@ -970,7 +1049,7 @@ const UsersView = {
       try { await ElMessageBox.confirm(t('deleteDeptConfirm', { n: d.name }), t('remove'), { type: 'warning', confirmButtonText: t('remove'), cancelButtonText: t('no') }); } catch (e) { return; }
       try { await api('/api/departments/' + d.id, { method: 'DELETE' }); ElMessage.success(t('deleted')); loadAll(); } catch (e) { ElMessageBox.alert(e.message, t('remove'), { type: 'warning' }); }
     }
-    return { tab, users, roles, perms, depts, loading, dlg, busy, form, openNew, openEdit, submit, suggestPositions,
+    return { tab, users, pending, apDlg, ap, openApprove, approve, reject, roles, perms, depts, loading, dlg, busy, form, openNew, openEdit, submit, suggestPositions,
       roleDlg, roleForm, newRole, saveRole, togglePerm, roleCmd, deptDlg, deptForm, newDept, editDept, saveDept, toggleSeeAll, deleteDept, store, roleName };
   },
   template: `
@@ -987,6 +1066,7 @@ const UsersView = {
           <el-table :data="users" style="width:100%">
             <el-table-column :label="t('username')" prop="username" width="130" />
             <el-table-column :label="t('displayName')" prop="display_name" min-width="110" />
+            <el-table-column :label="t('employeeNo')" min-width="100"><template #default="{ row }"><span class="mono-ish">{{ row.employee_no || '—' }}</span></template></el-table-column>
             <el-table-column :label="t('department')" min-width="120"><template #default="{ row }">{{ row.department_name || '—' }}</template></el-table-column>
             <el-table-column :label="t('position')" min-width="110"><template #default="{ row }">{{ row.position || '—' }}</template></el-table-column>
             <el-table-column :label="t('role')" width="120"><template #default="{ row }">
@@ -996,6 +1076,22 @@ const UsersView = {
             <el-table-column :label="t('lastLogin')" width="170"><template #default="{ row }"><span class="num muted">{{ row.last_login || '—' }}</span></template></el-table-column>
             <el-table-column width="80" align="right"><template #default="{ row }">
               <el-button link type="primary" @click="openEdit(row)">{{ t('edit') }}</el-button></template></el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane name="pending">
+        <template #label><span>{{ t('tabPending') }}</span><el-badge v-if="pending.length" :value="pending.length" class="tab-badge" /></template>
+        <p class="note">{{ t('pendingHelp') }}</p>
+        <div class="panel">
+          <el-table :data="pending" style="width:100%" :empty-text="t('noPending')">
+            <el-table-column :label="t('username')" prop="username" width="140" />
+            <el-table-column :label="t('displayName')" prop="display_name" min-width="110" />
+            <el-table-column :label="t('employeeNo')" min-width="110"><template #default="{ row }"><span class="mono-ish">{{ row.employee_no }}</span></template></el-table-column>
+            <el-table-column :label="t('appliedAt')" width="170"><template #default="{ row }"><span class="num muted">{{ row.created_at }}</span></template></el-table-column>
+            <el-table-column width="170" align="right"><template #default="{ row }">
+              <el-button size="small" type="success" @click="openApprove(row)">{{ t('approve') }}</el-button>
+              <el-button size="small" type="danger" plain @click="reject(row)">{{ t('reject') }}</el-button></template></el-table-column>
           </el-table>
         </div>
       </el-tab-pane>
@@ -1048,8 +1144,9 @@ const UsersView = {
 
     <el-dialog v-model="dlg" :title="form.id ? t('editUser') : t('addUser')" width="520px">
       <el-form label-width="110px" label-position="left" @submit.prevent="submit">
-        <el-form-item :label="t('username')"><el-input v-model="form.username" :disabled="!!form.id" /></el-form-item>
+        <el-form-item :label="t('username')"><el-input v-model="form.username" :disabled="!!form.id" maxlength="32" :placeholder="t('ruleUsername')" /></el-form-item>
         <el-form-item :label="t('displayName')"><el-input v-model="form.display_name" /></el-form-item>
+        <el-form-item :label="t('employeeNo')"><el-input v-model="form.employee_no" maxlength="32" :placeholder="t('employeeNoPh')" /></el-form-item>
         <el-form-item :label="t('department')">
           <el-select v-model="form.department_id" clearable :placeholder="t('noDept')" style="width:100%">
             <el-option v-for="d in depts" :key="d.id" :value="d.id" :label="d.name" /></el-select></el-form-item>
@@ -1070,6 +1167,19 @@ const UsersView = {
           </div></el-form-item>
       </el-form>
       <template #footer><el-button @click="dlg = false">{{ t('cancel') }}</el-button><el-button type="primary" :loading="busy" @click="submit">{{ t('save') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="apDlg" :title="t('approveTitle')" width="480px">
+      <p class="note">{{ ap.display_name }} · {{ ap.username }} · {{ t('employeeNo') }} {{ ap.employee_no }}</p>
+      <el-form label-width="96px" label-position="left">
+        <el-form-item :label="t('role')">
+          <el-select v-model="ap.role" style="width:100%"><el-option v-for="r in roles" :key="r.key" :value="r.key" :label="roleName(r.key)" /></el-select></el-form-item>
+        <el-form-item :label="t('department')">
+          <el-select v-model="ap.department_id" clearable :placeholder="t('noDept')" style="width:100%">
+            <el-option v-for="d in depts" :key="d.id" :value="d.id" :label="d.name" /></el-select></el-form-item>
+        <el-form-item :label="t('position')"><el-autocomplete v-model="ap.position" :fetch-suggestions="suggestPositions" clearable style="width:100%" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="apDlg = false">{{ t('cancel') }}</el-button><el-button type="success" @click="approve">{{ t('approveBtn') }}</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="roleDlg" :title="roleForm.key ? t('rename') : t('addRole')" width="420px">
@@ -1405,6 +1515,14 @@ const Root = {
       store.authChecked = true;
     }
     onMounted(checkAuth);
+    async function pollPending() {
+      if (store.user && store.user.role === 'admin') {
+        try { store.pendingCount = (await api('/api/users/pending/count')).count; } catch (e) {}
+      }
+    }
+    watch(() => store.user && store.user.id, pollPending);
+    const pendingTimer = setInterval(pollPending, 60000);
+    onBeforeUnmount(() => clearInterval(pendingTimer));
     function toggleLang() {
       store.lang = store.lang === 'zh' ? 'en' : 'zh';
       try { localStorage.setItem('cms_lang', store.lang); } catch (e) {}
@@ -1440,7 +1558,8 @@ const Root = {
             <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
             <el-menu-item v-if="can('ai.use')" index="ai"><el-icon><ChatDotRound /></el-icon><span>{{ t('navAI') }}</span></el-menu-item>
             <el-menu-item v-if="can('audit.view')" index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
-            <el-menu-item v-if="can('admin')" index="users"><el-icon><User /></el-icon><span>{{ t('navUsers') }}</span></el-menu-item>
+            <el-menu-item v-if="can('admin')" index="users"><el-icon><User /></el-icon><span>{{ t('navUsers') }}</span>
+              <el-badge v-if="store.pendingCount" :value="store.pendingCount" class="nav-badge" /></el-menu-item>
             <el-menu-item v-if="can('admin')" index="settings"><el-icon><Setting /></el-icon><span>{{ t('navSettings') }}</span></el-menu-item>
           </el-menu>
           <div class="nav-foot">

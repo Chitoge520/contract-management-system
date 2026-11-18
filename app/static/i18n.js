@@ -103,6 +103,16 @@ window.I18N = {
     tGlobal: '全系统每天最多 tokens', qMinute: '每人每分钟最多提问（次）', quotaHelp: '可在“用户与权限”里给个别用户单独设置上限',
     aiUsageTitle: '用量统计', globalToday: '今日全系统 {u} / {l} tokens', qToday: '今日提问', tToday: '今日 tokens', qMonth: '本月提问', tMonth: '本月 tokens',
     a_ai_question: 'AI 提问',
+
+    registerBtn: '注册账号', registerTitle: '注册账号', registerText: '提交后需要管理员审核，审核通过才能登录。', submitRegister: '提交注册申请',
+    noAccount: '还没有账号？', haveAccount: '已有账号？', backToLogin: '返回登录',
+    regDoneTitle: '注册申请已提交', regDoneText: '已发送给管理员审核。审核通过后，就可以用刚才的用户名和密码登录。',
+    employeeNo: '工号', employeeNoPh: '例如：BP-1001', ruleUsername: '只能使用英文字母和数字，3–32 位，不能有空格或符号',
+    ruleEmployeeNo: '必填，只能包含字母、数字和“-”，不能与他人重复', ruleLen: '至少 10 位', ruleLetter: '包含字母', ruleDigit: '包含数字',
+    pwSame: '两次密码一致', fixForm: '请按提示填写完整', tabPending: '待审核', pendingHelp: '自行注册的账号需要在这里审核通过后才能登录。通过时可以同时分配角色、部门和岗位；拒绝会删除这条申请。',
+    noPending: '没有待审核的申请', appliedAt: '申请时间', approve: '通过', reject: '拒绝', approveBtn: '通过并启用', approveTitle: '通过注册申请',
+    approved: '已通过', rejected: '已拒绝', rejectConfirm: '确定拒绝 {n} 的注册申请吗？申请会被删除。',
+    a_register: '注册申请', a_user_approve: '通过注册', a_user_reject: '拒绝注册',
     lang: 'English', yes: '确定', no: '取消',
   },
   en: {
@@ -209,6 +219,16 @@ window.I18N = {
     tGlobal: 'Tokens per day, whole system', qMinute: 'Questions per user per minute', quotaHelp: 'Individual users can get their own limits under Users & permissions',
     aiUsageTitle: 'Usage', globalToday: 'Today {u} / {l} tokens', qToday: 'Questions today', tToday: 'Tokens today', qMonth: 'Questions this month', tMonth: 'Tokens this month',
     a_ai_question: 'AI question',
+
+    registerBtn: 'Register', registerTitle: 'Create an account', registerText: 'An administrator must approve your account before you can sign in.', submitRegister: 'Submit registration',
+    noAccount: 'No account yet?', haveAccount: 'Already have an account?', backToLogin: 'Back to sign in',
+    regDoneTitle: 'Registration submitted', regDoneText: 'Sent to the administrator for approval. Once approved, sign in with the username and password you just chose.',
+    employeeNo: 'Employee ID', employeeNoPh: 'e.g. BP-1001', ruleUsername: 'Letters and digits only, 3–32 characters, no spaces or symbols',
+    ruleEmployeeNo: 'Required; letters, digits and "-" only; must be unique', ruleLen: 'At least 10 characters', ruleLetter: 'Contains a letter', ruleDigit: 'Contains a digit',
+    pwSame: 'Passwords match', fixForm: 'Please complete the form as indicated', tabPending: 'Pending approval', pendingHelp: 'Self-registered accounts can sign in only after you approve them here. Assign role, department and position when approving; rejecting deletes the request.',
+    noPending: 'No pending requests', appliedAt: 'Requested', approve: 'Approve', reject: 'Reject', approveBtn: 'Approve and activate', approveTitle: 'Approve registration',
+    approved: 'Approved', rejected: 'Rejected', rejectConfirm: 'Reject the registration of {n}? The request will be deleted.',
+    a_register: 'Registration request', a_user_approve: 'Approved registration', a_user_reject: 'Rejected registration',
     lang: '中文', yes: 'OK', no: 'Cancel',
   },
 };
