@@ -103,3 +103,38 @@ def test_backup_includes_settings_and_cleans_up(env, monkeypatch):
     assert "data/contracts.db" in names and "data/config.json" in names
     from pathlib import Path
     assert made and not Path(made[0]).exists(), "temporary backup folder was not removed"
+
+
+def test_processing_contract_is_locked(env):
+    admin = env["admin"]
+    cid = _upload(admin)["created"][0]
+    _wait_review(cid)
+    data = admin.get(f"/api/contracts/{cid}").json()["data"]
+    db.set_status(cid, "extracting", "AI")  # pretend the AI is working on it
+    blocked = [
+        admin.put(f"/api/contracts/{cid}", json={"data": dict(data, summary_zh="changed")}),
+        admin.post(f"/api/contracts/{cid}/confirm"),
+        admin.post(f"/api/contracts/{cid}/unconfirm"),
+        admin.post(f"/api/contracts/{cid}/reprocess"),
+        admin.delete(f"/api/contracts/{cid}"),
+    ]
+    assert [r.status_code for r in blocked] == [409] * 5
+    # notes and contract status are independent of the AI result and stay editable
+    r = admin.put(f"/api/contracts/{cid}", json={"notes": "call supplier", "lifecycle_status": "terminated"})
+    assert r.status_code == 200 and r.json()["notes"] == "call supplier"
+    db.set_status(cid, "review")
+    assert admin.delete(f"/api/contracts/{cid}").status_code == 200
+
+
+def test_worker_skips_contract_deleted_during_analysis(env, monkeypatch):
+    from app import pipeline
+    cid = _upload(env["admin"])["created"][0]
+    _wait_review(cid)
+
+    def extract_then_deleted(pages):  # the contract disappears while the AI is running
+        db.delete_contract(cid)
+        return {"basic": {}, "line_items": [{"name": "x", "amount": 1}]}, "fake"
+    monkeypatch.setattr(pipeline, "extract_contract", extract_then_deleted)
+    pipeline._process(cid, "extract")
+    assert db.q("SELECT * FROM line_items WHERE contract_id=?", (cid,)) == []
+    assert db.q("SELECT * FROM contracts WHERE id=?", (cid,)) == []

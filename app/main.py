@@ -44,6 +44,15 @@ def _get(cid, user=None):
     return row
 
 
+WORKING = ("queued", "reading", "extracting")
+
+
+def _require_idle(row):
+    """Contracts that are being read or analysed cannot be edited, reviewed, reprocessed or deleted."""
+    if row.get("status") in WORKING:
+        raise HTTPException(409, "合同正在处理中，请等处理完成后再操作 / This contract is being processed, try again when it is done")
+
+
 def _list_row(r):
     r = dict(r)
     r.pop("data_json", None)
@@ -596,6 +605,7 @@ def get_contract(cid: int, user=Depends(current_user)):
 def update_contract(cid: int, body: dict = Body(...), user=Depends(require("contract.edit"))):
     row = _get(cid, user)
     if "data" in body and body["data"] is not None:
+        _require_idle(row)  # notes and contract status may still be changed while the AI is working
         old = json.loads(row["data_json"]) if row.get("data_json") else {}
         changes = auth.diff(old, body["data"])
         if changes:
@@ -615,6 +625,7 @@ def update_contract(cid: int, body: dict = Body(...), user=Depends(require("cont
 @app.post("/api/contracts/{cid}/confirm")
 def confirm(cid: int, user=Depends(require("contract.review"))):
     row = _get(cid, user)
+    _require_idle(row)
     if not row.get("data_json"):
         raise HTTPException(400, "Nothing to confirm")
     db.ex("UPDATE contracts SET status='confirmed', confirmed_at=?, confirmed_by=?, updated_at=? WHERE id=?",
@@ -625,7 +636,7 @@ def confirm(cid: int, user=Depends(require("contract.review"))):
 
 @app.post("/api/contracts/{cid}/unconfirm")
 def unconfirm(cid: int, user=Depends(require("contract.review"))):
-    _get(cid, user)
+    _require_idle(_get(cid, user))
     db.ex("UPDATE contracts SET status='review', confirmed_at=NULL, confirmed_by=NULL, updated_at=? WHERE id=?", (db.now(), cid))
     auth.log(user, "unconfirm", cid)
     return get_contract(cid, user)
@@ -633,7 +644,7 @@ def unconfirm(cid: int, user=Depends(require("contract.review"))):
 
 @app.post("/api/contracts/{cid}/reprocess")
 def reprocess(cid: int, stage: str = "extract", user=Depends(require("contract.reprocess"))):
-    _get(cid, user)
+    _require_idle(_get(cid, user))
     db.ex("UPDATE contracts SET confirmed_at=NULL, confirmed_by=NULL WHERE id=?", (cid,))
     auth.log(user, "reread" if stage == "read" else "reextract", cid)
     pipeline.enqueue(cid, "read" if stage == "read" else "extract")
@@ -643,6 +654,7 @@ def reprocess(cid: int, stage: str = "extract", user=Depends(require("contract.r
 @app.delete("/api/contracts/{cid}")
 def delete(cid: int, user=Depends(require("contract.delete"))):
     row = _get(cid, user)
+    _require_idle(row)
     auth.log(user, "delete", cid, {"file": row["file_name"]})
     db.delete_contract(cid)
     try:

@@ -721,7 +721,7 @@ const DetailView = {
               <el-button @click="cancelEdit">{{ t('cancel') }}</el-button>
               <el-button type="primary" :loading="saving" @click="save">{{ t('save') }}</el-button>
             </template>
-            <el-button v-else @click="startEdit"><el-icon><Edit /></el-icon>{{ t('edit') }}</el-button>
+            <el-button v-else @click="startEdit" :disabled="WORKING.includes(c.status)"><el-icon><Edit /></el-icon>{{ t('edit') }}</el-button>
           </template>
           <el-button v-if="c.status === 'review' && can('contract.review')" type="success" @click="confirmReview"><el-icon><Check /></el-icon>{{ t('confirm') }}</el-button>
           <el-button v-if="c.status === 'confirmed' && can('contract.review')" @click="unconfirm">{{ t('unconfirm') }}</el-button>
@@ -732,7 +732,7 @@ const DetailView = {
             <el-dropdown-item v-if="can('contract.reprocess')" command="extract" :disabled="WORKING.includes(c.status)">{{ t('reextract') }}</el-dropdown-item>
             <el-dropdown-item v-if="can('contract.reprocess')" command="read" :disabled="WORKING.includes(c.status)">{{ t('reread') }}</el-dropdown-item>
             <el-dropdown-item v-if="can('contract.download')" command="download">{{ t('download') }}</el-dropdown-item>
-            <el-dropdown-item v-if="can('contract.delete')" command="delete" divided><span class="danger">{{ t('del') }}</span></el-dropdown-item>
+            <el-dropdown-item v-if="can('contract.delete')" command="delete" divided :disabled="WORKING.includes(c.status)"><span class="danger">{{ t('del') }}</span></el-dropdown-item>
           </el-dropdown-menu></template>
         </el-dropdown>
       </div>
