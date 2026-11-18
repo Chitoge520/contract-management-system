@@ -171,5 +171,6 @@ def delete_contract(cid):
     with _lock, connect() as c:
         c.execute("DELETE FROM line_items WHERE contract_id=?", (cid,))
         c.execute("DELETE FROM pages WHERE contract_id=?", (cid,))
+        c.execute("DELETE FROM contract_departments WHERE contract_id=?", (cid,))
         c.execute("DELETE FROM contracts WHERE id=?", (cid,))
         c.commit()

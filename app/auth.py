@@ -10,7 +10,8 @@ from fastapi import Depends, HTTPException, Request
 from . import db
 
 SESSION_COOKIE = "cms_session"
-SESSION_DAYS = 7
+SESSION_HOURS = 12      # a login never lasts longer than this
+IDLE_MINUTES = 30       # signed out after this long without any request (no page of the system open)
 # Every action an administrator can grant or withhold per role.
 PERMISSIONS = [
     "contract.upload",       # upload contracts
@@ -82,6 +83,8 @@ def init():
             c.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
         if "employee_no" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN employee_no TEXT")
+        if "last_seen" not in {r[1] for r in c.execute("PRAGMA table_info(sessions)")}:
+            c.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_no ON users(employee_no COLLATE NOCASE) "
                   "WHERE employee_no IS NOT NULL")
         for key, (name, perms) in BUILTIN_ROLES.items():
@@ -202,10 +205,19 @@ def create_user(username, password, role="viewer", display_name=None, employee_n
 # ---------------- sessions ----------------
 def new_session(user_id):
     token = secrets.token_urlsafe(32)
-    exp = (datetime.now() + timedelta(days=SESSION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    db.ex("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?,?,?,?)", (token, user_id, db.now(), exp))
-    db.ex("DELETE FROM sessions WHERE expires_at < ?", (db.now(),))
+    exp = _ts(datetime.now() + timedelta(hours=SESSION_HOURS))
+    db.ex("INSERT INTO sessions (token, user_id, created_at, expires_at, last_seen) VALUES (?,?,?,?,?)",
+          (token, user_id, db.now(), exp, db.now()))
+    db.ex("DELETE FROM sessions WHERE expires_at < ? OR coalesce(last_seen, created_at) < ?", (db.now(), _idle_cutoff()))
     return token
+
+
+def _ts(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _idle_cutoff():
+    return _ts(datetime.now() - timedelta(minutes=IDLE_MINUTES))
 
 
 def end_session(token):
@@ -215,9 +227,13 @@ def end_session(token):
 def current_user(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if token:
-        row = db.q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id "
-                   "WHERE s.token=? AND s.expires_at>=? AND u.active=1 AND u.status='active'", (token, db.now()), one=True)
+        row = db.q("SELECT u.*, s.last_seen AS session_last_seen FROM sessions s JOIN users u ON u.id=s.user_id "
+                   "WHERE s.token=? AND s.expires_at>=? AND coalesce(s.last_seen, s.created_at)>=? "
+                   "AND u.active=1 AND u.status='active'", (token, db.now(), _idle_cutoff()), one=True)
         if row:
+            # an open page keeps polling, which keeps the login alive; write at most once a minute
+            if (row.pop("session_last_seen") or "") < _ts(datetime.now() - timedelta(seconds=60)):
+                db.ex("UPDATE sessions SET last_seen=? WHERE token=?", (db.now(), token))
             return row
     raise HTTPException(401, "请先登录 / Please sign in")
 
