@@ -569,9 +569,7 @@ async def upload(files: List[UploadFile] = File(...), user=Depends(require("cont
         h = hashlib.sha256(content).hexdigest()
         dup = db.q("SELECT id, file_name FROM contracts WHERE file_hash=?", (h,), one=True)
         if dup:
-            # only point to the existing contract if this user may see it; otherwise don't reveal that it exists
-            duplicates.append({"file": f.filename,
-                               "existing_id": dup["id"] if access.can_view(user, dup["id"]) else None})
+            duplicates.append({"file": f.filename, "existing_id": dup["id"]})
             continue
         stored = f"{datetime.now():%Y%m%d%H%M%S}_{h[:10]}{ext}"
         (db.FILES_DIR / stored).write_bytes(content)

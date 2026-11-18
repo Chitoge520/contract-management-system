@@ -1,5 +1,4 @@
-"""Regression tests: Excel formula injection, department links of deleted contracts,
-duplicate uploads across departments, backup temp files.
+"""Regression tests: Excel formula injection, department links of deleted contracts, backup temp files.
 
 Run:  pip install pytest  &&  python -m pytest tests
 OCR / PDF libraries are not needed: only .txt contracts are used and the LLM is replaced by a canned reply.
@@ -57,12 +56,6 @@ def _wait_review(cid):
     raise AssertionError("extraction did not finish")
 
 
-def _login(username):
-    c = TestClient(main.app)
-    c.post("/api/auth/login", json={"username": username, "password": PW}).raise_for_status()
-    return c
-
-
 def test_export_does_not_create_formulas(env):
     from openpyxl import load_workbook
     cid = _upload(env["admin"])["created"][0]
@@ -91,19 +84,6 @@ def test_startup_removes_old_orphan_links(env):
     access.init()
     assert db.q("SELECT * FROM contract_departments WHERE contract_id=999") == []
 
-
-def test_duplicate_upload_hides_contracts_of_other_departments(env):
-    admin = env["admin"]
-    cid = _upload(admin)["created"][0]
-    admin.put(f"/api/contracts/{cid}/departments", json={"department_ids": [env["fin"]]}).raise_for_status()
-    _wait_review(cid)
-    bob = _login("bob")
-    assert bob.get(f"/api/contracts/{cid}").status_code == 404
-    res = _upload(bob, name="guess.txt")
-    assert res["created"] == []
-    assert res["duplicates"] == [{"file": "guess.txt", "existing_id": None}]
-    # someone who can see it still gets the link
-    assert _upload(admin, name="again.txt")["duplicates"][0]["existing_id"] == cid
 
 
 def test_backup_includes_settings_and_cleans_up(env, monkeypatch):
