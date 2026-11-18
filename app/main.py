@@ -13,14 +13,13 @@ from fastapi import Body, Depends, FastAPI, File, HTTPException, Request, Respon
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, db, llm, pipeline
+from . import access, auth, db, llm, pipeline
 from .auth import current_user, require
 
 STATIC = Path(__file__).resolve().parent / "static"
 ALLOWED = {".pdf", ".docx", ".txt"}
 
 app = FastAPI(title="Contract Management System")
-editor = require("editor")
 admin = require("admin")
 
 
@@ -28,12 +27,13 @@ admin = require("admin")
 def _startup():
     db.init()
     auth.init()
+    access.init()
     pipeline.start()
 
 
-def _get(cid):
+def _get(cid, user=None):
     row = db.q("SELECT * FROM contracts WHERE id=?", (cid,), one=True)
-    if not row:
+    if not row or (user is not None and not access.can_view(user, cid)):
         raise HTTPException(404, "Contract not found")
     return row
 
@@ -152,7 +152,14 @@ def list_users(user=Depends(admin)):
 @app.post("/api/users")
 def add_user(body: dict = Body(...), user=Depends(admin)):
     u = auth.create_user(body.get("username"), body.get("password"), body.get("role") or "viewer", body.get("display_name"))
-    auth.log(user, "user_create", detail={"username": u["username"], "role": u["role"]})
+    dept_id = body.get("department_id") or None
+    if dept_id and not access.department(dept_id):
+        raise HTTPException(400, "Department not found")
+    db.ex("UPDATE users SET department_id=?, position=? WHERE id=?", (dept_id, body.get("position") or None, u["id"]))
+    u = db.q("SELECT * FROM users WHERE id=?", (u["id"],), one=True)
+    auth.log(user, "user_create", detail={"username": u["username"], "role": u["role"],
+                                          "department": (access.department(dept_id) or {}).get("name"),
+                                          "position": u["position"]})
     return auth.public_user(u)
 
 
@@ -163,13 +170,24 @@ def update_user(uid: int, body: dict = Body(...), user=Depends(admin)):
         raise HTTPException(404, "User not found")
     changes = {}
     if "role" in body and body["role"] != u["role"]:
-        if body["role"] not in auth.ROLES:
+        if not auth.role(body["role"]):
             raise HTTPException(400, "Invalid role")
         changes["role"] = [u["role"], body["role"]]
     if "active" in body and int(bool(body["active"])) != u["active"]:
         changes["active"] = [u["active"], int(bool(body["active"]))]
     if "display_name" in body and (body["display_name"] or "") != (u["display_name"] or ""):
         changes["display_name"] = [u["display_name"], body["display_name"]]
+    if "department_id" in body and (body["department_id"] or None) != u.get("department_id"):
+        if body["department_id"] and not access.department(body["department_id"]):
+            raise HTTPException(400, "Department not found")
+        changes["department_id"] = [u.get("department_id"), body["department_id"] or None]
+    if "position" in body and (body["position"] or "") != (u.get("position") or ""):
+        changes["position"] = [u.get("position"), body["position"] or None]
+    for k in ("ai_daily_questions", "ai_daily_tokens"):
+        if k in body:
+            v = int(body[k]) if body[k] not in (None, "") else None
+            if v != u.get(k):
+                changes[k] = [u.get(k), v]
     # never lock out the last active admin
     becomes_non_admin = changes.get("role", [None, "admin"])[1] != "admin" or changes.get("active", [1, 1])[1] == 0
     if u["role"] == "admin" and becomes_non_admin:
@@ -186,15 +204,146 @@ def update_user(uid: int, body: dict = Body(...), user=Depends(admin)):
     if changes.get("active", [1, 1])[1] == 0:
         db.ex("DELETE FROM sessions WHERE user_id=?", (uid,))
     if changes:
-        auth.log(user, "user_update", detail={"username": u["username"], "changes": changes})
+        shown = dict(changes)
+        if "department_id" in shown:
+            shown["department"] = [(access.department(x) or {}).get("name") for x in shown.pop("department_id")]
+        auth.log(user, "user_update", detail={"username": u["username"], "changes": shown})
     return auth.public_user(db.q("SELECT * FROM users WHERE id=?", (uid,), one=True))
+
+
+# ================= roles (admin) =================
+@app.get("/api/roles")
+def list_roles(user=Depends(current_user)):
+    return {"roles": auth.roles(), "permissions": auth.PERMISSIONS}
+
+
+def _clean_perms(perms):
+    return [p for p in (perms or []) if p in auth.PERMISSIONS]
+
+
+@app.post("/api/roles")
+def add_role(body: dict = Body(...), user=Depends(admin)):
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "角色名称不能为空 / Name required")
+    if db.q("SELECT 1 FROM roles WHERE lower(name)=lower(?)", (name,), one=True):
+        raise HTTPException(400, "角色已存在 / Role already exists")
+    import secrets as _s
+    key = "r_" + _s.token_hex(4)
+    perms = _clean_perms(body.get("permissions"))
+    db.ex("INSERT INTO roles (key, name, permissions, builtin, created_at) VALUES (?,?,?,0,?)",
+          (key, name, json.dumps(perms), db.now()))
+    auth.log(user, "role_create", detail={"name": name, "permissions": perms})
+    return auth.role(key)
+
+
+@app.put("/api/roles/{key}")
+def update_role(key: str, body: dict = Body(...), user=Depends(admin)):
+    r = auth.role(key)
+    if not r:
+        raise HTTPException(404, "Role not found")
+    if key == "admin":
+        raise HTTPException(400, "管理员角色固定拥有全部权限 / The admin role always has every permission")
+    name = (body.get("name") or r["name"]).strip()
+    perms = _clean_perms(body.get("permissions", r["permissions"]))
+    db.ex("UPDATE roles SET name=?, permissions=? WHERE key=?", (name, json.dumps(perms), key))
+    added = [p for p in perms if p not in r["permissions"]]
+    removed = [p for p in r["permissions"] if p not in perms]
+    auth.log(user, "role_update", detail={"name": name, "added": added, "removed": removed,
+                                          **({"renamed": [r["name"], name]} if name != r["name"] else {})})
+    return auth.role(key)
+
+
+@app.delete("/api/roles/{key}")
+def delete_role(key: str, user=Depends(admin)):
+    r = auth.role(key)
+    if not r:
+        raise HTTPException(404, "Role not found")
+    if r["builtin"]:
+        raise HTTPException(400, "内置角色不能删除 / Built-in roles cannot be deleted")
+    n = db.q("SELECT count(*) n FROM users WHERE role=?", (key,), one=True)["n"]
+    if n:
+        raise HTTPException(400, f"还有 {n} 个用户使用该角色，请先调整 / {n} users still have this role")
+    db.ex("DELETE FROM roles WHERE key=?", (key,))
+    auth.log(user, "role_delete", detail={"name": r["name"]})
+    return {"ok": True}
+
+
+# ================= departments =================
+@app.get("/api/departments")
+def list_departments(user=Depends(current_user)):
+    rows = db.q("SELECT d.*, (SELECT count(*) FROM users u WHERE u.department_id=d.id) users, "
+                "(SELECT count(*) FROM contract_departments cd WHERE cd.department_id=d.id) contracts "
+                "FROM departments d ORDER BY d.name")
+    return rows
+
+
+@app.post("/api/departments")
+def add_department(body: dict = Body(...), user=Depends(admin)):
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "部门名称不能为空 / Name required")
+    if db.q("SELECT 1 FROM departments WHERE lower(name)=lower(?)", (name,), one=True):
+        raise HTTPException(400, "部门已存在 / Department already exists")
+    did = db.ex("INSERT INTO departments (name, see_all, created_at) VALUES (?,?,?)",
+                (name, 1 if body.get("see_all") else 0, db.now()))
+    auth.log(user, "dept_create", detail={"name": name, "see_all": bool(body.get("see_all"))})
+    return db.q("SELECT * FROM departments WHERE id=?", (did,), one=True)
+
+
+@app.put("/api/departments/{did}")
+def update_department(did: int, body: dict = Body(...), user=Depends(admin)):
+    d = access.department(did)
+    if not d:
+        raise HTTPException(404, "Department not found")
+    name = (body.get("name") or d["name"]).strip()
+    see_all = 1 if body.get("see_all", d["see_all"]) else 0
+    if name.lower() != d["name"].lower() and db.q("SELECT 1 FROM departments WHERE lower(name)=lower(?)", (name,), one=True):
+        raise HTTPException(400, "部门已存在 / Department already exists")
+    db.ex("UPDATE departments SET name=?, see_all=? WHERE id=?", (name, see_all, did))
+    auth.log(user, "dept_update", detail={"name": [d["name"], name], "see_all": [bool(d["see_all"]), bool(see_all)]})
+    return access.department(did)
+
+
+@app.delete("/api/departments/{did}")
+def delete_department(did: int, user=Depends(admin)):
+    d = access.department(did)
+    if not d:
+        raise HTTPException(404, "Department not found")
+    n_users = db.q("SELECT count(*) n FROM users WHERE department_id=?", (did,), one=True)["n"]
+    if n_users:
+        raise HTTPException(400, f"该部门还有 {n_users} 个用户，请先调整他们的部门 / {n_users} users still in this department")
+    orphaned = db.q("SELECT contract_id FROM contract_departments WHERE department_id=? AND contract_id NOT IN "
+                    "(SELECT contract_id FROM contract_departments WHERE department_id<>?)", (did, did))
+    if orphaned:
+        raise HTTPException(400, f"有 {len(orphaned)} 份合同只属于这个部门，删除后会变成全公司可见，请先调整这些合同的部门 / "
+                                 f"{len(orphaned)} contracts belong only to this department; reassign them first")
+    db.ex("DELETE FROM contract_departments WHERE department_id=?", (did,))
+    db.ex("DELETE FROM departments WHERE id=?", (did,))
+    auth.log(user, "dept_delete", detail={"name": d["name"]})
+    return {"ok": True}
+
+
+@app.put("/api/contracts/{cid}/departments")
+def set_contract_departments(cid: int, body: dict = Body(...), user=Depends(require("contract.assign_dept"))):
+    _get(cid, user)
+    before = [d["name"] for d in access.departments_of(cid)]
+    new_ids = access.set_departments(cid, body.get("department_ids") or [])
+    after = [d["name"] for d in access.departments_of(cid)]
+    if before != after:
+        auth.log(user, "departments", cid, {"old": before, "new": after})
+    return access.departments_of(cid) if new_ids is not None else []
 
 
 # ================= audit =================
 @app.get("/api/audit")
 def audit(user_q: str = "", action: str = "", contract_id: int = 0, date_from: str = "", date_to: str = "",
-          limit: int = 200, offset: int = 0, user=Depends(current_user)):
+          limit: int = 200, offset: int = 0, user=Depends(require("audit.view"))):
     sql, args = "FROM audit_log WHERE 1=1", []
+    if user["role"] != "admin":
+        cond, cargs = access.visible_sql(user, "c")
+        sql += f" AND (user_id=? OR contract_id IN (SELECT c.id FROM contracts c WHERE {cond}))"
+        args += [user["id"]] + cargs
     if user_q:
         sql += " AND lower(coalesce(username,'')) LIKE ?"
         args.append(f"%{user_q.lower()}%")
@@ -230,6 +379,7 @@ def _decorate(rows):
 
 @app.get("/api/contracts/{cid}/history")
 def history(cid: int, user=Depends(current_user)):
+    access.require_view(user, cid)
     rows = db.q("SELECT * FROM audit_log WHERE contract_id=? ORDER BY id DESC", (cid,))
     _decorate(rows)
     return rows
@@ -283,9 +433,14 @@ def _hits(cid, data, words):
 
 @app.get("/api/contracts")
 def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "", lifecycle: str = "", year: str = "",
-                   user=Depends(current_user)):
-    sql = "SELECT * FROM contracts WHERE 1=1"
-    args = []
+                   dept: str = "", user=Depends(current_user)):
+    cond, args = access.visible_sql(user, "contracts")
+    sql = "SELECT * FROM contracts WHERE " + cond
+    if dept == "none":
+        sql += " AND NOT EXISTS (SELECT 1 FROM contract_departments cd WHERE cd.contract_id=contracts.id)"
+    elif dept:
+        sql += " AND EXISTS (SELECT 1 FROM contract_departments cd WHERE cd.contract_id=contracts.id AND cd.department_id=?)"
+        args.append(int(dept))
     words = q.split()
     for word in words:
         like = f"%{word.lower()}%"
@@ -310,8 +465,11 @@ def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "
         args.append(year)
     sql += " ORDER BY id DESC"
     out = []
-    for r in db.q(sql, args):
+    found = db.q(sql, args)
+    depts = access.departments_map([r["id"] for r in found])
+    for r in found:
         row = _list_row(r)
+        row["departments"] = depts.get(r["id"], [])
         if words:
             row["hits"] = _hits(r["id"], json.loads(r["data_json"]) if r.get("data_json") else {}, words)
         out.append(row)
@@ -319,7 +477,7 @@ def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "
 
 
 @app.post("/api/contracts")
-async def upload(files: List[UploadFile] = File(...), user=Depends(editor)):
+async def upload(files: List[UploadFile] = File(...), user=Depends(require("contract.upload"))):
     created, duplicates, rejected = [], [], []
     for f in files:
         ext = Path(f.filename).suffix.lower()
@@ -336,6 +494,7 @@ async def upload(files: List[UploadFile] = File(...), user=Depends(editor)):
         (db.FILES_DIR / stored).write_bytes(content)
         cid = db.ex("INSERT INTO contracts (file_name, stored_name, file_hash, uploaded_at, updated_at, status, uploaded_by) "
                     "VALUES (?,?,?,?,?, 'queued', ?)", (f.filename, stored, h, db.now(), db.now(), _name(user)))
+        access.assign_default(cid, user)
         auth.log(user, "upload", cid, {"file": f.filename}, label=f.filename)
         pipeline.enqueue(cid, "read")
         created.append(cid)
@@ -344,16 +503,17 @@ async def upload(files: List[UploadFile] = File(...), user=Depends(editor)):
 
 @app.get("/api/contracts/{cid}")
 def get_contract(cid: int, user=Depends(current_user)):
-    row = _get(cid)
+    row = _get(cid, user)
     data = json.loads(row["data_json"]) if row.get("data_json") else None
     row = _list_row(row)
     row["data"] = data
+    row["departments"] = access.departments_of(cid)
     return row
 
 
 @app.put("/api/contracts/{cid}")
-def update_contract(cid: int, body: dict = Body(...), user=Depends(editor)):
-    row = _get(cid)
+def update_contract(cid: int, body: dict = Body(...), user=Depends(require("contract.edit"))):
+    row = _get(cid, user)
     if "data" in body and body["data"] is not None:
         old = json.loads(row["data_json"]) if row.get("data_json") else {}
         changes = auth.diff(old, body["data"])
@@ -372,8 +532,8 @@ def update_contract(cid: int, body: dict = Body(...), user=Depends(editor)):
 
 
 @app.post("/api/contracts/{cid}/confirm")
-def confirm(cid: int, user=Depends(editor)):
-    row = _get(cid)
+def confirm(cid: int, user=Depends(require("contract.review"))):
+    row = _get(cid, user)
     if not row.get("data_json"):
         raise HTTPException(400, "Nothing to confirm")
     db.ex("UPDATE contracts SET status='confirmed', confirmed_at=?, confirmed_by=?, updated_at=? WHERE id=?",
@@ -383,16 +543,16 @@ def confirm(cid: int, user=Depends(editor)):
 
 
 @app.post("/api/contracts/{cid}/unconfirm")
-def unconfirm(cid: int, user=Depends(editor)):
-    _get(cid)
+def unconfirm(cid: int, user=Depends(require("contract.review"))):
+    _get(cid, user)
     db.ex("UPDATE contracts SET status='review', confirmed_at=NULL, confirmed_by=NULL, updated_at=? WHERE id=?", (db.now(), cid))
     auth.log(user, "unconfirm", cid)
     return get_contract(cid, user)
 
 
 @app.post("/api/contracts/{cid}/reprocess")
-def reprocess(cid: int, stage: str = "extract", user=Depends(editor)):
-    _get(cid)
+def reprocess(cid: int, stage: str = "extract", user=Depends(require("contract.reprocess"))):
+    _get(cid, user)
     db.ex("UPDATE contracts SET confirmed_at=NULL, confirmed_by=NULL WHERE id=?", (cid,))
     auth.log(user, "reread" if stage == "read" else "reextract", cid)
     pipeline.enqueue(cid, "read" if stage == "read" else "extract")
@@ -400,8 +560,8 @@ def reprocess(cid: int, stage: str = "extract", user=Depends(editor)):
 
 
 @app.delete("/api/contracts/{cid}")
-def delete(cid: int, user=Depends(admin)):
-    row = _get(cid)
+def delete(cid: int, user=Depends(require("contract.delete"))):
+    row = _get(cid, user)
     auth.log(user, "delete", cid, {"file": row["file_name"]})
     db.delete_contract(cid)
     try:
@@ -413,9 +573,11 @@ def delete(cid: int, user=Depends(admin)):
 
 @app.get("/api/contracts/{cid}/file")
 def get_file(cid: int, download: int = 0, user=Depends(current_user)):
-    row = _get(cid)
+    row = _get(cid, user)
     path = db.FILES_DIR / row["stored_name"]
     media = "application/pdf" if path.suffix.lower() == ".pdf" else None
+    if download and "contract.download" not in auth.perms_of(user):
+        raise HTTPException(403, "没有下载原件的权限 / Permission denied")
     if download:
         return FileResponse(path, media_type=media, filename=row["file_name"])
     return FileResponse(path, media_type=media,
@@ -424,31 +586,35 @@ def get_file(cid: int, download: int = 0, user=Depends(current_user)):
 
 @app.get("/api/contracts/{cid}/pages")
 def get_pages(cid: int, user=Depends(current_user)):
-    _get(cid)
+    _get(cid, user)
     return db.q("SELECT page_no, text, redacted_text, is_ocr FROM pages WHERE contract_id=? ORDER BY page_no", (cid,))
 
 
 @app.get("/api/stats")
 def stats(user=Depends(current_user)):
-    by_status = {r["status"]: r["n"] for r in db.q("SELECT status, count(*) n FROM contracts GROUP BY status")}
-    parties = [r["party_b"] for r in db.q("SELECT DISTINCT party_b FROM contracts WHERE party_b IS NOT NULL ORDER BY party_b")]
+    cond, a = access.visible_sql(user, "contracts")
+    by_status = {r["status"]: r["n"] for r in db.q(f"SELECT status, count(*) n FROM contracts WHERE {cond} GROUP BY status", a)}
+    parties = [r["party_b"] for r in db.q(
+        f"SELECT DISTINCT party_b FROM contracts WHERE party_b IS NOT NULL AND {cond} ORDER BY party_b", a)]
     years = sorted({(r["y"] or "")[:4] for r in db.q(
-        "SELECT coalesce(signing_date, effective_date, start_date, uploaded_at) y FROM contracts")} - {""}, reverse=True)
+        f"SELECT coalesce(signing_date, effective_date, start_date, uploaded_at) y FROM contracts WHERE {cond}", a)} - {""},
+        reverse=True)
     return {"by_status": by_status, "parties": parties, "years": years, "count": sum(by_status.values())}
 
 
 # ================= export / backup =================
 @app.get("/api/export.xlsx")
-def export_xlsx(ids: str = "", user=Depends(current_user)):
+def export_xlsx(ids: str = "", user=Depends(require("contract.export"))):
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
 
+    allowed = set(access.visible_ids(user))
     if ids:
-        id_list = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+        id_list = [int(x) for x in ids.split(",") if x.strip().isdigit() and int(x) in allowed]
         rows = [db.q("SELECT * FROM contracts WHERE id=?", (i,), one=True) for i in id_list]
         rows = [r for r in rows if r]
     else:
-        rows = db.q("SELECT * FROM contracts ORDER BY id")
+        rows = [r for r in db.q("SELECT * FROM contracts ORDER BY id") if r["id"] in allowed]
     auth.log(user, "export", detail={"contracts": len(rows)})
     wb = Workbook()
     head_font = Font(bold=True, color="FFFFFF")

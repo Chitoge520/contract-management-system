@@ -18,10 +18,10 @@ const STATUSES = ['queued', 'reading', 'extracting', 'review', 'confirmed', 'fai
 const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
 const ROLES = ['admin', 'editor', 'viewer'];
-const ACTIONS = ['upload', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
+const ACTIONS = ['upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
   'lifecycle_status', 'notes', 'login', 'login_failed', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
-const RANK = { viewer: 1, editor: 2, admin: 3 };
-const can = role => !!store.user && RANK[store.user.role] >= RANK[role];
+// permission check: 'admin' = administrators; otherwise a permission key such as 'contract.upload'
+const can = p => !!store.user && (p === 'admin' ? store.user.role === 'admin' : (store.user.permissions || []).includes(p));
 
 function fmt(n, cur) {
   if (n === null || n === undefined || n === '' || isNaN(Number(n))) return '';
@@ -96,6 +96,8 @@ const FIELD_LABELS = { contract_no: 'contractNo', title: 'title', title_zh: 'tit
   exchange_rate_rule: 'fxRule', total_amount_text: 'totalText', party_a_address: 'addrA', party_b_address: 'addrB' };
 function showVal(v) { return v === null || v === undefined || v === '' ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v)); }
 function who(name) { return name || t('system'); }
+const roleNames = reactive({});
+function roleName(key) { return ['admin', 'editor', 'viewer'].includes(key) ? t('r_' + key) : (roleNames[key] || key); }
 
 const mixin = { methods: { t, fmt, statusTag, can, who }, computed: { lang() { return store.lang; } } };
 
@@ -127,9 +129,11 @@ const AuditDetail = {
       if (r.action === 'edit') return (d.changes || []).length + ' ' + t('changes');
       if (r.action === 'lifecycle_status') return t('l_' + (d.old || 'active')) + ' → ' + t('l_' + d.new);
       if (r.action === 'notes') return showVal(d.new);
-      if (r.action === 'user_create') return d.username + ' (' + t('r_' + d.role) + ')';
+      if (r.action === 'user_create') return d.username + ' (' + roleName(d.role) + (d.department ? ' · ' + d.department : '') + ')';
       if (r.action === 'user_update') return d.username + ': ' + Object.entries(d.changes || {}).map(([k, v]) =>
-        k === 'role' ? t('role') + ' ' + t('r_' + v[0]) + '→' + t('r_' + v[1]) :
+        k === 'role' ? t('role') + ' ' + roleName(v[0]) + '→' + roleName(v[1]) :
+        k === 'department' ? t('department') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
+        k === 'position' ? t('position') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
         k === 'active' ? (v[1] ? t('enabled') : t('disabled')) : k === 'password' ? t('resetPw') : k).join(', ');
       if (r.action === 'extracted') return (d.model || '') + (d.items != null ? ' · ' + d.items + ' items' : '');
       if (r.action === 'extract_failed') return d.error;
@@ -138,6 +142,10 @@ const AuditDetail = {
       if (r.action === 'login') return d.ip ? 'IP ' + d.ip : '';
       if (r.action === 'login_failed') return (d.username || '') + (d.ip ? ' · IP ' + d.ip : '');
       if (r.action === 'settings') return Object.keys(d).join(', ');
+      if (r.action === 'departments') return ((d.old || []).join('、') || t('companyWide')) + ' → ' + ((d.new || []).join('、') || t('companyWide'));
+      if (r.action === 'dept_create' || r.action === 'dept_delete' || r.action === 'role_create' || r.action === 'role_delete') return d.name;
+      if (r.action === 'dept_update') return (d.name || []).filter((x, i, a) => a.indexOf(x) === i).join(' → ') + (d.see_all && d.see_all[0] !== d.see_all[1] ? ' · ' + t('seeAll') + ': ' + (d.see_all[1] ? '✓' : '✗') : '');
+      if (r.action === 'role_update') return d.name + (d.added && d.added.length ? ' +' + d.added.map(p => t('p_' + p)).join('、') : '') + (d.removed && d.removed.length ? ' −' + d.removed.map(p => t('p_' + p)).join('、') : '');
       return '';
     });
     return { open, summary };
@@ -296,7 +304,9 @@ const ListView = {
     const rows = ref([]); const stats = ref({ by_status: {}, parties: [], years: [], count: 0 });
     const loading = ref(true); const showUpload = ref(false); const uploader = ref(null);
     const up = reactive({ total: 0, done: 0, created: 0 });
-    const f = reactive({ q: store.route.query.q || '', type: '', party: '', year: '', status: '', lifecycle: '' });
+    const f = reactive({ q: store.route.query.q || '', type: '', party: '', year: '', status: '', lifecycle: '', dept: '' });
+    const depts = ref([]);
+    api('/api/departments').then(r => { depts.value = r; }).catch(() => {});
     let timer = null, debounce = null, seq = 0;
     async function load() {
       const my = ++seq;
@@ -310,11 +320,11 @@ const ListView = {
       clearTimeout(timer);
       if (rows.value.some(r => WORKING.includes(r.status))) timer = setTimeout(load, 3000);
     }
-    watch(() => [f.type, f.party, f.year, f.status, f.lifecycle], load);
+    watch(() => [f.type, f.party, f.year, f.status, f.lifecycle, f.dept], load);
     watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(load, 300); });
     onMounted(load);
     onBeforeUnmount(() => clearTimeout(timer));
-    const filtered = computed(() => !!(f.q || f.type || f.party || f.year || f.status || f.lifecycle));
+    const filtered = computed(() => !!(f.q || f.type || f.party || f.year || f.status || f.lifecycle || f.dept));
     const searching = computed(() => !!f.q.trim());
     const working = computed(() => WORKING.reduce((a, s) => a + (stats.value.by_status[s] || 0), 0));
 
@@ -339,7 +349,7 @@ const ListView = {
 
     function exportXlsx() { location.href = '/api/export.xlsx?ids=' + rows.value.map(r => r.id).join(','); }
     function titleOf(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || r.file_name; }
-    return { rows, stats, f, loading, filtered, searching, working, showUpload, uploader, up, onChange, onUploaded, onUploadError,
+    return { depts, rows, stats, f, loading, filtered, searching, working, showUpload, uploader, up, onChange, onUploaded, onUploadError,
       onDialogClosed, exportXlsx, titleOf, TYPES, STATUSES, LIFECYCLES, WORKING, go };
   },
   template: `
@@ -347,8 +357,8 @@ const ListView = {
     <div class="ph">
       <div><h1>{{ t('contracts') }}</h1><div class="sub">{{ t('contractsSub') }}</div></div>
       <div class="actions">
-        <el-button @click="exportXlsx" :disabled="!rows.length"><el-icon><Download /></el-icon>{{ t('export') }}</el-button>
-        <el-button v-if="can('editor')" type="primary" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
+        <el-button v-if="can('contract.export')" @click="exportXlsx" :disabled="!rows.length"><el-icon><Download /></el-icon>{{ t('export') }}</el-button>
+        <el-button v-if="can('contract.upload')" type="primary" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
       </div>
     </div>
 
@@ -369,6 +379,9 @@ const ListView = {
         <el-option v-for="x in stats.years" :key="x" :value="x" :label="x" /></el-select>
       <el-select v-model="f.status" :placeholder="t('status')" clearable style="width:130px">
         <el-option v-for="x in STATUSES" :key="x" :value="x" :label="t('s_' + x)" /></el-select>
+      <el-select v-if="depts.length" v-model="f.dept" :placeholder="t('department')" clearable style="width:150px">
+        <el-option value="none" :label="t('companyWide')" />
+        <el-option v-for="d in depts" :key="d.id" :value="String(d.id)" :label="d.name" /></el-select>
       <el-select v-model="f.lifecycle" :placeholder="t('lifecycle')" clearable style="width:130px">
         <el-option v-for="x in LIFECYCLES" :key="x" :value="x" :label="t('l_' + x)" /></el-select>
     </div>
@@ -386,6 +399,11 @@ const ListView = {
         <el-table-column :label="t('type')" width="110">
           <template #default="{ row }"><el-tag v-if="row.contract_type" type="info" effect="plain" size="small">{{ t('t_' + row.contract_type) }}</el-tag></template></el-table-column>
         <el-table-column :label="t('partyB')" prop="party_b" min-width="200" show-overflow-tooltip />
+        <el-table-column v-if="depts.length" :label="t('department')" min-width="120">
+          <template #default="{ row }">
+            <template v-if="(row.departments || []).length"><el-tag v-for="d in row.departments" :key="d.id" size="small" effect="plain" class="mr-xs">{{ d.name }}</el-tag></template>
+            <span v-else class="muted small">{{ t('companyWide') }}</span>
+          </template></el-table-column>
         <el-table-column :label="t('totalAmount')" width="170" align="right">
           <template #default="{ row }"><span class="num">{{ fmt(row.total_amount, row.currency) }}</span></template></el-table-column>
         <el-table-column :label="t('signingDate')" width="110">
@@ -398,7 +416,7 @@ const ListView = {
       <el-empty v-else-if="!loading && filtered" :description="t('noMatch')" />
       <div v-else-if="!loading" class="empty-state">
         <h2>{{ t('emptyTitle') }}</h2><p>{{ t('emptyText') }}</p>
-        <el-button v-if="can('editor')" type="primary" size="large" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
+        <el-button v-if="can('contract.upload')" type="primary" size="large" @click="showUpload = true"><el-icon><Upload /></el-icon>{{ t('upload') }}</el-button>
       </div>
     </div>
 
@@ -426,6 +444,17 @@ const DetailView = {
     const hitItem = ref(query.item !== undefined && query.item !== '' ? Number(query.item) : -1);
     const pages = ref([]); const srcMode = ref('masked'); const find = ref(query.tab === 'source' ? (query.q || '') : ''); const saving = ref(false);
     const historyRows = ref([]);
+    const deptDlg = ref(false); const deptSel = ref([]); const allDepts = ref([]);
+    async function openDept() {
+      allDepts.value = await api('/api/departments');
+      deptSel.value = (c.value.departments || []).map(d => d.id); deptDlg.value = true;
+    }
+    async function saveDept() {
+      try {
+        c.value.departments = await api('/api/contracts/' + props.id + '/departments', { method: 'PUT', json: { department_ids: deptSel.value } });
+        deptDlg.value = false; ElMessage.success(t('saved'));
+      } catch (e) { ElMessage.error(e.message); }
+    }
     let timer = null;
     const pdfRef = ref(null);
     watch(showPdf, v => { try { localStorage.setItem('cms_pdf', v ? '1' : '0'); } catch (e) {} });
@@ -584,7 +613,7 @@ const DetailView = {
 
     return { c, d, draft, editing, tab, showPdf, pdfPage, pdfKey, pdfRef, pages, srcMode, find, saving, isPdf, cur, title, subTitle, recon,
       startEdit, cancelEdit, save, setMeta, confirmReview, unconfirm, onMore, addRow, removeRow, cols, basicFields, amountFields,
-      hl, shownPages, openPage, go, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows };
+      hl, shownPages, openPage, go, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows, deptDlg, deptSel, allDepts, openDept, saveDept };
   },
   template: `
   <div v-if="c">
@@ -600,6 +629,11 @@ const DetailView = {
           <span v-if="c.page_count">{{ c.page_count }} {{ t('pages') }}<template v-if="c.ocr_pages"> · {{ c.ocr_pages }} {{ t('ocrPages') }}</template></span>
         </div>
         <div class="meta-row people">
+          <span class="dept-line"><el-icon><OfficeBuilding /></el-icon>
+            <template v-if="(c.departments || []).length"><el-tag v-for="d in c.departments" :key="d.id" size="small" effect="plain">{{ d.name }}</el-tag></template>
+            <el-tag v-else size="small" type="success" effect="plain">{{ t('companyWide') }}</el-tag>
+            <el-button v-if="can('contract.assign_dept')" link type="primary" size="small" @click="openDept">{{ t('changeDept') }}</el-button>
+          </span>
           <span v-if="c.uploaded_by">{{ t('uploadedBy') }}：{{ c.uploaded_by }} <span class="muted">{{ (c.uploaded_at || '').slice(0, 16) }}</span></span>
           <span v-if="c.updated_by">{{ t('updatedBy') }}：{{ c.updated_by }}</span>
           <span v-if="c.confirmed_by" class="ok">{{ t('reviewedBy') }}：{{ c.confirmed_by }} <span class="muted">{{ (c.confirmed_at || '').slice(0, 16) }}</span></span>
@@ -608,25 +642,27 @@ const DetailView = {
       <div class="actions">
         <el-button @click="showPdf = !showPdf" :type="showPdf ? '' : 'primary'" plain>
           <el-icon><Document /></el-icon>{{ showPdf ? t('hidePdf') : t('showPdf') }}</el-button>
-        <el-select :model-value="c.lifecycle_status || 'active'" @change="v => setMeta('lifecycle_status', v)" style="width:120px" :disabled="!can('editor')">
+        <el-select :model-value="c.lifecycle_status || 'active'" @change="v => setMeta('lifecycle_status', v)" style="width:120px" :disabled="!can('contract.edit')">
           <el-option v-for="x in LIFECYCLES" :key="x" :value="x" :label="t('l_' + x)" />
         </el-select>
-        <template v-if="c.data && can('editor')">
-          <template v-if="editing">
-            <el-button @click="cancelEdit">{{ t('cancel') }}</el-button>
-            <el-button type="primary" :loading="saving" @click="save">{{ t('save') }}</el-button>
+        <template v-if="c.data">
+          <template v-if="can('contract.edit')">
+            <template v-if="editing">
+              <el-button @click="cancelEdit">{{ t('cancel') }}</el-button>
+              <el-button type="primary" :loading="saving" @click="save">{{ t('save') }}</el-button>
+            </template>
+            <el-button v-else @click="startEdit"><el-icon><Edit /></el-icon>{{ t('edit') }}</el-button>
           </template>
-          <el-button v-else @click="startEdit"><el-icon><Edit /></el-icon>{{ t('edit') }}</el-button>
-          <el-button v-if="c.status === 'review'" type="success" @click="confirmReview"><el-icon><Check /></el-icon>{{ t('confirm') }}</el-button>
-          <el-button v-if="c.status === 'confirmed'" @click="unconfirm">{{ t('unconfirm') }}</el-button>
+          <el-button v-if="c.status === 'review' && can('contract.review')" type="success" @click="confirmReview"><el-icon><Check /></el-icon>{{ t('confirm') }}</el-button>
+          <el-button v-if="c.status === 'confirmed' && can('contract.review')" @click="unconfirm">{{ t('unconfirm') }}</el-button>
         </template>
         <el-dropdown trigger="click" @command="onMore">
           <el-button><el-icon><MoreFilled /></el-icon></el-button>
           <template #dropdown><el-dropdown-menu>
-            <el-dropdown-item v-if="can('editor')" command="extract" :disabled="WORKING.includes(c.status)">{{ t('reextract') }}</el-dropdown-item>
-            <el-dropdown-item v-if="can('editor')" command="read" :disabled="WORKING.includes(c.status)">{{ t('reread') }}</el-dropdown-item>
-            <el-dropdown-item command="download">{{ t('download') }}</el-dropdown-item>
-            <el-dropdown-item v-if="can('admin')" command="delete" divided><span class="danger">{{ t('del') }}</span></el-dropdown-item>
+            <el-dropdown-item v-if="can('contract.reprocess')" command="extract" :disabled="WORKING.includes(c.status)">{{ t('reextract') }}</el-dropdown-item>
+            <el-dropdown-item v-if="can('contract.reprocess')" command="read" :disabled="WORKING.includes(c.status)">{{ t('reread') }}</el-dropdown-item>
+            <el-dropdown-item v-if="can('contract.download')" command="download">{{ t('download') }}</el-dropdown-item>
+            <el-dropdown-item v-if="can('contract.delete')" command="delete" divided><span class="danger">{{ t('del') }}</span></el-dropdown-item>
           </el-dropdown-menu></template>
         </el-dropdown>
       </div>
@@ -635,7 +671,7 @@ const DetailView = {
     <el-alert v-if="WORKING.includes(c.status)" type="info" :closable="false" show-icon class="mb"
       :title="t('processingNow') + '：' + t('s_' + c.status) + (c.progress ? ' — ' + c.progress : '')" />
     <el-alert v-if="c.status === 'failed'" type="error" :closable="false" show-icon class="mb" :title="t('failedTitle')" :description="c.error" />
-    <el-alert v-if="c.status === 'review' && !editing && can('editor')" type="warning" :closable="false" show-icon class="mb" :title="t('reviewTip')" />
+    <el-alert v-if="c.status === 'review' && !editing && (can('contract.review') || can('contract.edit'))" type="warning" :closable="false" show-icon class="mb" :title="t('reviewTip')" />
 
     <div class="detail" :class="{ nopdf: !showPdf }">
       <div class="detail-main">
@@ -682,7 +718,7 @@ const DetailView = {
               <div class="card">
                 <h2>{{ t('notes') }}</h2>
                 <el-input :model-value="c.notes" @change="v => setMeta('notes', v)" @update:model-value="v => c.notes = v"
-                  type="textarea" :autosize="{minRows:2}" :placeholder="t('notesPh')" :disabled="!can('editor')" />
+                  type="textarea" :autosize="{minRows:2}" :placeholder="t('notesPh')" :disabled="!can('contract.edit')" />
               </div>
             </template>
           </el-tab-pane>
@@ -779,6 +815,13 @@ const DetailView = {
         <el-empty v-else :description="t('noPreview')" />
       </div>
     </div>
+    <el-dialog v-model="deptDlg" :title="t('changeDept')" width="460px">
+      <el-select v-model="deptSel" multiple style="width:100%" :placeholder="t('companyWide')">
+        <el-option v-for="d in allDepts" :key="d.id" :value="d.id" :label="d.name" />
+      </el-select>
+      <p class="note mt-s">{{ t('deptHelp') }}</p>
+      <template #footer><el-button @click="deptDlg = false">{{ t('cancel') }}</el-button><el-button type="primary" @click="saveDept">{{ t('save') }}</el-button></template>
+    </el-dialog>
   </div>`,
 };
 
@@ -828,64 +871,216 @@ const AuditView = {
   </div>`,
 };
 
-// ---------- users view ----------
+// ---------- users / roles / departments (admin) ----------
 const UsersView = {
   mixins: [mixin],
   setup() {
-    const rows = ref([]); const loading = ref(true); const dlg = ref(false); const busy = ref(false);
-    const form = reactive({ id: null, username: '', display_name: '', role: 'editor', active: true, password: '' });
-    async function load() { loading.value = true; try { rows.value = await api('/api/users'); } catch (e) { ElMessage.error(e.message); } loading.value = false; }
-    onMounted(load);
-    function openNew() { Object.assign(form, { id: null, username: '', display_name: '', role: 'editor', active: true, password: '' }); dlg.value = true; }
-    function openEdit(u) { Object.assign(form, { id: u.id, username: u.username, display_name: u.display_name, role: u.role, active: !!u.active, password: '' }); dlg.value = true; }
+    const tab = ref(['users', 'roles', 'depts'].includes(store.route.query.tab) ? store.route.query.tab : 'users');
+    const users = ref([]); const roles = ref([]); const perms = ref([]); const depts = ref([]); const loading = ref(true);
+    async function loadAll() {
+      loading.value = true;
+      try {
+        const [u, r, d] = await Promise.all([api('/api/users'), api('/api/roles'), api('/api/departments')]);
+        users.value = u; roles.value = r.roles; perms.value = r.permissions; depts.value = d;
+        r.roles.forEach(x => { roleNames[x.key] = x.name; });
+      } catch (e) { ElMessage.error(e.message); }
+      loading.value = false;
+    }
+    onMounted(loadAll);
+    const positions = computed(() => [...new Set(users.value.map(u => u.position).filter(Boolean))]);
+    function suggestPositions(q, cb) { cb(positions.value.filter(p => !q || p.includes(q)).map(value => ({ value }))); }
+
+    // ---- users ----
+    const dlg = ref(false); const busy = ref(false);
+    const blank = { id: null, username: '', display_name: '', role: 'viewer', department_id: null, position: '', active: true,
+      password: '', ai_daily_questions: null, ai_daily_tokens: null };
+    const form = reactive(Object.assign({}, blank));
+    function openNew() { Object.assign(form, blank); dlg.value = true; }
+    function openEdit(u) {
+      Object.assign(form, blank, { id: u.id, username: u.username, display_name: u.display_name, role: u.role,
+        department_id: u.department_id, position: u.position || '', active: !!u.active,
+        ai_daily_questions: u.ai_daily_questions, ai_daily_tokens: u.ai_daily_tokens });
+      dlg.value = true;
+    }
     async function submit() {
       busy.value = true;
+      const body = { display_name: form.display_name, role: form.role, department_id: form.department_id || null,
+        position: form.position || null, ai_daily_questions: form.ai_daily_questions, ai_daily_tokens: form.ai_daily_tokens };
       try {
         if (form.id) {
-          const body = { display_name: form.display_name, role: form.role, active: form.active };
+          body.active = form.active;
           if (form.password) body.password = form.password;
           await api('/api/users/' + form.id, { method: 'PUT', json: body });
         } else {
-          await api('/api/users', { method: 'POST', json: { username: form.username, display_name: form.display_name, role: form.role, password: form.password } });
+          await api('/api/users', { method: 'POST', json: Object.assign(body, { username: form.username, password: form.password }) });
         }
-        dlg.value = false; ElMessage.success(t('saved')); load();
+        dlg.value = false; ElMessage.success(t('saved')); loadAll();
       } catch (e) { ElMessage.error(e.message); }
       busy.value = false;
     }
-    return { rows, loading, dlg, busy, form, openNew, openEdit, submit, ROLES, store };
+
+    // ---- roles: permission matrix, every tick saves immediately ----
+    const roleDlg = ref(false); const roleForm = reactive({ key: null, name: '', copyFrom: 'viewer' });
+    function newRole() { Object.assign(roleForm, { key: null, name: '', copyFrom: 'viewer' }); roleDlg.value = true; }
+    function renameRole(r) { Object.assign(roleForm, { key: r.key, name: r.name }); roleDlg.value = true; }
+    async function saveRole() {
+      try {
+        if (roleForm.key) await api('/api/roles/' + roleForm.key, { method: 'PUT', json: { name: roleForm.name } });
+        else {
+          const src = roles.value.find(r => r.key === roleForm.copyFrom);
+          await api('/api/roles', { method: 'POST', json: { name: roleForm.name, permissions: src ? src.permissions : [] } });
+        }
+        roleDlg.value = false; ElMessage.success(t('saved')); loadAll();
+      } catch (e) { ElMessage.error(e.message); }
+    }
+    async function togglePerm(r, p, on) {
+      const next = on ? r.permissions.concat([p]) : r.permissions.filter(x => x !== p);
+      try { const res = await api('/api/roles/' + r.key, { method: 'PUT', json: { permissions: next } }); r.permissions = res.permissions; ElMessage.success(t('saved')); }
+      catch (e) { ElMessage.error(e.message); }
+    }
+    async function roleCmd(r, cmd) {
+      if (cmd === 'rename') return renameRole(r);
+      try { await ElMessageBox.confirm(t('deleteRoleConfirm', { n: r.name }), t('remove'), { type: 'warning', confirmButtonText: t('remove'), cancelButtonText: t('no') }); } catch (e) { return; }
+      try { await api('/api/roles/' + r.key, { method: 'DELETE' }); ElMessage.success(t('deleted')); loadAll(); } catch (e) { ElMessage.error(e.message); }
+    }
+
+    // ---- departments ----
+    const deptDlg = ref(false); const deptForm = reactive({ id: null, name: '', see_all: false });
+    function newDept() { Object.assign(deptForm, { id: null, name: '', see_all: false }); deptDlg.value = true; }
+    function editDept(d) { Object.assign(deptForm, { id: d.id, name: d.name, see_all: !!d.see_all }); deptDlg.value = true; }
+    async function saveDept() {
+      try {
+        if (deptForm.id) await api('/api/departments/' + deptForm.id, { method: 'PUT', json: { name: deptForm.name, see_all: deptForm.see_all } });
+        else await api('/api/departments', { method: 'POST', json: { name: deptForm.name, see_all: deptForm.see_all } });
+        deptDlg.value = false; ElMessage.success(t('saved')); loadAll();
+      } catch (e) { ElMessage.error(e.message); }
+    }
+    async function toggleSeeAll(d, v) {
+      try { await api('/api/departments/' + d.id, { method: 'PUT', json: { see_all: v } }); d.see_all = v ? 1 : 0; ElMessage.success(t('saved')); }
+      catch (e) { ElMessage.error(e.message); }
+    }
+    async function deleteDept(d) {
+      try { await ElMessageBox.confirm(t('deleteDeptConfirm', { n: d.name }), t('remove'), { type: 'warning', confirmButtonText: t('remove'), cancelButtonText: t('no') }); } catch (e) { return; }
+      try { await api('/api/departments/' + d.id, { method: 'DELETE' }); ElMessage.success(t('deleted')); loadAll(); } catch (e) { ElMessageBox.alert(e.message, t('remove'), { type: 'warning' }); }
+    }
+    return { tab, users, roles, perms, depts, loading, dlg, busy, form, openNew, openEdit, submit, suggestPositions,
+      roleDlg, roleForm, newRole, saveRole, togglePerm, roleCmd, deptDlg, deptForm, newDept, editDept, saveDept, toggleSeeAll, deleteDept, store, roleName };
   },
   template: `
   <div class="users">
     <div class="ph"><div><h1>{{ t('navUsers') }}</h1><div class="sub">{{ t('usersSub') }}</div></div>
-      <div class="actions"><el-button type="primary" @click="openNew"><el-icon><Plus /></el-icon>{{ t('addUser') }}</el-button></div></div>
-    <div class="role-help">
-      <div v-for="r in ROLES" :key="r"><el-tag size="small" :type="r === 'admin' ? 'danger' : r === 'editor' ? 'warning' : 'info'">{{ t('r_' + r) }}</el-tag> <span class="muted small">{{ t('r_' + r + '_d') }}</span></div>
-    </div>
-    <div class="panel" v-loading="loading">
-      <el-table :data="rows" style="width:100%">
-        <el-table-column :label="t('username')" prop="username" width="160" />
-        <el-table-column :label="t('displayName')" prop="display_name" min-width="140" />
-        <el-table-column :label="t('role')" width="120"><template #default="{ row }">
-          <el-tag size="small" :type="row.role === 'admin' ? 'danger' : row.role === 'editor' ? 'warning' : 'info'">{{ t('r_' + row.role) }}</el-tag></template></el-table-column>
-        <el-table-column :label="t('active')" width="100"><template #default="{ row }">
-          <span :class="row.active ? 'ok' : 'muted'">{{ row.active ? t('enabled') : t('disabled') }}</span></template></el-table-column>
-        <el-table-column :label="t('lastLogin')" width="190"><template #default="{ row }"><span class="num muted">{{ row.last_login || '—' }}</span></template></el-table-column>
-        <el-table-column width="90" align="right"><template #default="{ row }">
-          <el-button link type="primary" @click="openEdit(row)">{{ t('edit') }}</el-button></template></el-table-column>
-      </el-table>
-    </div>
-    <el-dialog v-model="dlg" :title="form.id ? t('editUser') : t('addUser')" width="460px">
-      <el-form label-width="96px" label-position="left" @submit.prevent="submit">
+      <div class="actions">
+        <el-button v-if="tab === 'users'" type="primary" @click="openNew"><el-icon><Plus /></el-icon>{{ t('addUser') }}</el-button>
+        <el-button v-if="tab === 'roles'" type="primary" @click="newRole"><el-icon><Plus /></el-icon>{{ t('addRole') }}</el-button>
+        <el-button v-if="tab === 'depts'" type="primary" @click="newDept"><el-icon><Plus /></el-icon>{{ t('addDept') }}</el-button>
+      </div></div>
+    <el-tabs v-model="tab" v-loading="loading">
+      <el-tab-pane :label="t('tabUsers')" name="users">
+        <div class="panel">
+          <el-table :data="users" style="width:100%">
+            <el-table-column :label="t('username')" prop="username" width="130" />
+            <el-table-column :label="t('displayName')" prop="display_name" min-width="110" />
+            <el-table-column :label="t('department')" min-width="120"><template #default="{ row }">{{ row.department_name || '—' }}</template></el-table-column>
+            <el-table-column :label="t('position')" min-width="110"><template #default="{ row }">{{ row.position || '—' }}</template></el-table-column>
+            <el-table-column :label="t('role')" width="120"><template #default="{ row }">
+              <el-tag size="small" :type="row.role === 'admin' ? 'danger' : row.role === 'editor' ? 'warning' : 'info'">{{ roleName(row.role) }}</el-tag></template></el-table-column>
+            <el-table-column :label="t('active')" width="80"><template #default="{ row }">
+              <span :class="row.active ? 'ok' : 'muted'">{{ row.active ? t('enabled') : t('disabled') }}</span></template></el-table-column>
+            <el-table-column :label="t('lastLogin')" width="170"><template #default="{ row }"><span class="num muted">{{ row.last_login || '—' }}</span></template></el-table-column>
+            <el-table-column width="80" align="right"><template #default="{ row }">
+              <el-button link type="primary" @click="openEdit(row)">{{ t('edit') }}</el-button></template></el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane :label="t('tabRoles')" name="roles">
+        <p class="note">{{ t('rolesHelp') }}</p>
+        <div class="panel">
+          <el-table :data="perms" style="width:100%" class="perm-matrix">
+            <el-table-column :label="t('permission')" min-width="220" fixed>
+              <template #default="{ row }"><div>{{ t('p_' + row) }}</div><div class="muted small">{{ t('pd_' + row) }}</div></template></el-table-column>
+            <el-table-column v-for="r in roles" :key="r.key" min-width="120" align="center">
+              <template #header>
+                <div class="role-head">
+                  <span>{{ roleName(r.key) }}</span>
+                  <el-dropdown v-if="r.key !== 'admin'" trigger="click" @command="cmd => roleCmd(r, cmd)">
+                    <el-icon class="role-more"><MoreFilled /></el-icon>
+                    <template #dropdown><el-dropdown-menu>
+                      <el-dropdown-item command="rename">{{ t('rename') }}</el-dropdown-item>
+                      <el-dropdown-item v-if="!r.builtin" command="delete" divided><span class="danger">{{ t('remove') }}</span></el-dropdown-item>
+                    </el-dropdown-menu></template>
+                  </el-dropdown>
+                </div>
+                <div class="muted small">{{ t('nUsers', { n: r.users }) }}</div>
+              </template>
+              <template #default="{ row }">
+                <el-checkbox :model-value="r.permissions.includes(row)" :disabled="r.key === 'admin'" @change="v => togglePerm(r, row, v)" />
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+        <p class="note mt-s">{{ t('adminOnlyHelp') }}</p>
+      </el-tab-pane>
+
+      <el-tab-pane :label="t('tabDepts')" name="depts">
+        <p class="note">{{ t('deptsHelp') }}</p>
+        <div class="panel">
+          <el-table :data="depts" style="width:100%" :empty-text="t('noDepts')">
+            <el-table-column :label="t('department')" prop="name" min-width="160" />
+            <el-table-column :label="t('seeAll')" width="160"><template #default="{ row }">
+              <el-switch :model-value="!!row.see_all" @change="v => toggleSeeAll(row, v)" /></template></el-table-column>
+            <el-table-column :label="t('members')" width="90" align="right"><template #default="{ row }">{{ row.users }}</template></el-table-column>
+            <el-table-column :label="t('contracts')" width="90" align="right"><template #default="{ row }">{{ row.contracts }}</template></el-table-column>
+            <el-table-column width="140" align="right"><template #default="{ row }">
+              <el-button link type="primary" @click="editDept(row)">{{ t('edit') }}</el-button>
+              <el-button link type="danger" @click="deleteDept(row)">{{ t('remove') }}</el-button></template></el-table-column>
+          </el-table>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
+
+    <el-dialog v-model="dlg" :title="form.id ? t('editUser') : t('addUser')" width="520px">
+      <el-form label-width="110px" label-position="left" @submit.prevent="submit">
         <el-form-item :label="t('username')"><el-input v-model="form.username" :disabled="!!form.id" /></el-form-item>
         <el-form-item :label="t('displayName')"><el-input v-model="form.display_name" /></el-form-item>
+        <el-form-item :label="t('department')">
+          <el-select v-model="form.department_id" clearable :placeholder="t('noDept')" style="width:100%">
+            <el-option v-for="d in depts" :key="d.id" :value="d.id" :label="d.name" /></el-select></el-form-item>
+        <el-form-item :label="t('position')">
+          <el-autocomplete v-model="form.position" :fetch-suggestions="suggestPositions" clearable style="width:100%" :placeholder="t('positionPh')" /></el-form-item>
         <el-form-item :label="t('role')">
-          <el-radio-group v-model="form.role"><el-radio-button v-for="r in ROLES" :key="r" :value="r">{{ t('r_' + r) }}</el-radio-button></el-radio-group>
-          <div class="muted small w100">{{ t('r_' + form.role + '_d') }}</div></el-form-item>
+          <el-select v-model="form.role" style="width:100%" :disabled="form.id === store.user.id">
+            <el-option v-for="r in roles" :key="r.key" :value="r.key" :label="roleName(r.key)" /></el-select></el-form-item>
         <el-form-item v-if="form.id" :label="t('active')"><el-switch v-model="form.active" :disabled="form.id === store.user.id" /></el-form-item>
         <el-form-item :label="form.id ? t('resetPw') : t('password')">
-          <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? t('resetPwPh') : ''" /></el-form-item>
+          <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? t('resetPwPh') : t('pwRule')" /></el-form-item>
+        <el-form-item :label="t('aiQuota')">
+          <div class="quota-row">
+            <el-input-number v-model="form.ai_daily_questions" :min="0" :max="10000" :controls="false" :placeholder="t('useDefault')" />
+            <span class="muted small">{{ t('questionsPerDay') }}</span>
+            <el-input-number v-model="form.ai_daily_tokens" :min="0" :max="100000000" :step="10000" :controls="false" :placeholder="t('useDefault')" />
+            <span class="muted small">{{ t('tokensPerDay') }}</span>
+          </div></el-form-item>
       </el-form>
       <template #footer><el-button @click="dlg = false">{{ t('cancel') }}</el-button><el-button type="primary" :loading="busy" @click="submit">{{ t('save') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="roleDlg" :title="roleForm.key ? t('rename') : t('addRole')" width="420px">
+      <el-form label-width="96px" label-position="left" @submit.prevent="saveRole">
+        <el-form-item :label="t('roleName')"><el-input v-model="roleForm.name" :placeholder="t('roleNamePh')" /></el-form-item>
+        <el-form-item v-if="!roleForm.key" :label="t('copyFrom')">
+          <el-select v-model="roleForm.copyFrom" style="width:100%">
+            <el-option v-for="r in roles" :key="r.key" :value="r.key" :label="roleName(r.key)" /></el-select></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="roleDlg = false">{{ t('cancel') }}</el-button><el-button type="primary" @click="saveRole">{{ t('save') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="deptDlg" :title="deptForm.id ? t('editDept') : t('addDept')" width="420px">
+      <el-form label-width="96px" label-position="left" @submit.prevent="saveDept">
+        <el-form-item :label="t('department')"><el-input v-model="deptForm.name" :placeholder="t('deptNamePh')" /></el-form-item>
+        <el-form-item :label="t('seeAll')"><el-switch v-model="deptForm.see_all" /><span class="muted small ml-s">{{ t('seeAllHelp') }}</span></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="deptDlg = false">{{ t('cancel') }}</el-button><el-button type="primary" @click="saveDept">{{ t('save') }}</el-button></template>
     </el-dialog>
   </div>`,
 };
@@ -978,7 +1173,9 @@ const Root = {
     const active = computed(() => store.route.name === 'detail' ? 'list' : store.route.name);
     const allowed = computed(() => {
       const n = store.route.name;
-      return !((n === 'users' || n === 'settings') && !can('admin'));
+      if ((n === 'users' || n === 'settings') && !can('admin')) return false;
+      if (n === 'audit' && !can('audit.view')) return false;
+      return true;
     });
     return { store, epLocale, toggleLang, active, go, onUserCmd, pwDlg, pw, changePw, allowed };
   },
@@ -992,7 +1189,7 @@ const Root = {
             <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
           <el-menu :default-active="active" @select="k => go(k)" background-color="transparent" text-color="#C9D3DD" active-text-color="#ffffff" class="nav-menu">
             <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
-            <el-menu-item index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
+            <el-menu-item v-if="can('audit.view')" index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
             <el-menu-item v-if="can('admin')" index="users"><el-icon><User /></el-icon><span>{{ t('navUsers') }}</span></el-menu-item>
             <el-menu-item v-if="can('admin')" index="settings"><el-icon><Setting /></el-icon><span>{{ t('navSettings') }}</span></el-menu-item>
           </el-menu>

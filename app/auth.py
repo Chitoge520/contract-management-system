@@ -11,8 +11,25 @@ from . import db
 
 SESSION_COOKIE = "cms_session"
 SESSION_DAYS = 7
-ROLES = ("admin", "editor", "viewer")
-ROLE_RANK = {"viewer": 1, "editor": 2, "admin": 3}
+# Every action an administrator can grant or withhold per role.
+PERMISSIONS = [
+    "contract.upload",       # upload contracts
+    "contract.edit",         # edit extracted data, notes, contract status
+    "contract.review",       # confirm / undo review
+    "contract.reprocess",    # re-read text / re-run AI extraction
+    "contract.assign_dept",  # change which departments a contract belongs to
+    "contract.delete",       # delete contracts
+    "contract.download",     # download the original file
+    "contract.export",       # export to Excel
+    "ai.use",                # use the AI assistant
+    "audit.view",            # view the audit log
+]
+BUILTIN_ROLES = {
+    "admin": ("管理员", PERMISSIONS),
+    "editor": ("编辑", ["contract.upload", "contract.edit", "contract.review", "contract.reprocess",
+                        "contract.assign_dept", "contract.download", "contract.export", "ai.use", "audit.view"]),
+    "viewer": ("只读", ["contract.download", "contract.export", "ai.use", "audit.view"]),
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -43,6 +60,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_contract ON audit_log(contract_id);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+CREATE TABLE IF NOT EXISTS roles (
+    key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    permissions TEXT NOT NULL DEFAULT '[]',
+    builtin INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT
+);
 """
 
 
@@ -53,7 +77,34 @@ def init():
         for col in ("uploaded_by", "updated_by", "confirmed_by"):
             if col not in cols:
                 c.execute(f"ALTER TABLE contracts ADD COLUMN {col} TEXT")
+        for key, (name, perms) in BUILTIN_ROLES.items():
+            if not c.execute("SELECT 1 FROM roles WHERE key=?", (key,)).fetchone():
+                c.execute("INSERT INTO roles (key, name, permissions, builtin, created_at) VALUES (?,?,?,1,?)",
+                          (key, name, json.dumps(perms), db.now()))
         c.commit()
+
+
+# ---------------- roles & permissions ----------------
+def role(key):
+    r = db.q("SELECT * FROM roles WHERE key=?", (key,), one=True)
+    if r:
+        r["permissions"] = PERMISSIONS if key == "admin" else [p for p in json.loads(r["permissions"]) if p in PERMISSIONS]
+    return r
+
+
+def roles():
+    out = db.q("SELECT * FROM roles ORDER BY builtin DESC, created_at")
+    for r in out:
+        r["permissions"] = PERMISSIONS if r["key"] == "admin" else [p for p in json.loads(r["permissions"]) if p in PERMISSIONS]
+        r["users"] = db.q("SELECT count(*) n FROM users WHERE role=?", (r["key"],), one=True)["n"]
+    return out
+
+
+def perms_of(user):
+    if user.get("role") == "admin":
+        return list(PERMISSIONS)
+    r = role(user.get("role"))
+    return r["permissions"] if r else []
 
 
 # ---------------- passwords ----------------
@@ -83,7 +134,16 @@ def validate_password(pw: str):
 def public_user(u):
     if not u:
         return None
-    return {k: u[k] for k in ("id", "username", "display_name", "role", "active", "created_at", "last_login")}
+    out = {k: u.get(k) for k in ("id", "username", "display_name", "role", "active", "created_at", "last_login",
+                                  "department_id", "position", "ai_daily_questions", "ai_daily_tokens")}
+    dept = db.q("SELECT name, see_all FROM departments WHERE id=?", (u.get("department_id"),), one=True) \
+        if u.get("department_id") else None
+    out["department_name"] = dept["name"] if dept else None
+    r = role(u.get("role"))
+    out["role_name"] = r["name"] if r else u.get("role")
+    out["permissions"] = perms_of(u)
+    out["sees_all"] = u.get("role") == "admin" or bool(dept and dept["see_all"])
+    return out
 
 
 def user_count():
@@ -94,7 +154,7 @@ def create_user(username, password, role="viewer", display_name=None):
     username = (username or "").strip()
     if not username:
         raise HTTPException(400, "用户名不能为空 / Username required")
-    if role not in ROLES:
+    if not db.q("SELECT 1 FROM roles WHERE key=?", (role,), one=True):
         raise HTTPException(400, "Invalid role")
     validate_password(password)
     if db.q("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,), one=True):
@@ -127,10 +187,12 @@ def current_user(request: Request):
     raise HTTPException(401, "请先登录 / Please sign in")
 
 
-def require(role):
+def require(perm):
+    """Dependency: 'admin' = administrators only; otherwise a permission from PERMISSIONS."""
     def dep(user=Depends(current_user)):
-        if ROLE_RANK.get(user["role"], 0) < ROLE_RANK[role]:
-            raise HTTPException(403, "没有权限 / Permission denied")
+        ok = user["role"] == "admin" if perm == "admin" else perm in perms_of(user)
+        if not ok:
+            raise HTTPException(403, "没有权限，请联系管理员 / Permission denied")
         return user
     return dep
 

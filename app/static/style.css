@@ -198,3 +198,11 @@ mark { background: #FFE9A8; }
   border: 1px solid #33475B; color: #C9D3DD; border-radius: 6px; padding: 5px 6px; cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap; }
 .foot-actions button:hover { color: #fff; border-color: #5B6E82; background: rgba(255,255,255,.06); }
 @media (max-width: 760px) { .foot-actions { margin: 0 0 0 8px; } .nav-foot { display: flex; align-items: center; } }
+.mr-xs { margin-right: 4px; }
+.ml-s { margin-left: 8px; }
+.dept-line { display: inline-flex; align-items: center; gap: 6px; }
+.role-head { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.role-more { cursor: pointer; color: var(--ink-3); }
+.perm-matrix .el-checkbox { height: auto; }
+.quota-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.quota-row .el-input-number { width: 110px; }
