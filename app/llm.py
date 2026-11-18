@@ -26,7 +26,8 @@ DEFAULT_CONFIG = {"provider": "deepseek", "base_url": PROVIDERS["deepseek"]["bas
                   "ai_daily_questions": 100,         # per user per day (users can have an override)
                   "ai_daily_tokens": 500000,         # per user per day
                   "ai_global_daily_tokens": 5000000, # whole system per day
-                  "ai_per_minute": 6}                # per user per minute
+                  "ai_per_minute": 6,                # per user per minute
+                  "modules_disabled": []}            # modules switched off for everybody (auth.MODULES keys)
 
 MAX_INPUT_CHARS = 180_000
 

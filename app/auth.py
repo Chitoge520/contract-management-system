@@ -14,6 +14,9 @@ SESSION_HOURS = 12      # a login never lasts longer than this
 IDLE_MINUTES = 30       # signed out after this long without any request (no page of the system open)
 # Every action an administrator can grant or withhold per role.
 PERMISSIONS = [
+    # modules: which parts of the system a role can open (see MODULES)
+    "module.projects",       # projects page, project of a contract
+    "module.payments",       # payment tracking: payment nodes, payment records and proof files
     "contract.upload",       # upload contracts
     "contract.edit",         # edit extracted data, notes, contract status
     "contract.review",       # confirm / undo review
@@ -31,9 +34,14 @@ BUILTIN_ROLES = {
     "admin": ("管理员", PERMISSIONS),
     "editor": ("编辑", ["contract.upload", "contract.edit", "contract.review", "contract.reprocess",
                         "contract.assign_dept", "contract.download", "contract.export", "payment.record", "project.manage", "ai.use",
+                        "module.projects", "module.payments",
                         "audit.view"]),
-    "viewer": ("只读", ["contract.download", "contract.export", "ai.use", "audit.view"]),
+    "viewer": ("只读", ["module.projects", "module.payments", "contract.download", "contract.export", "ai.use", "audit.view"]),
 }
+# Modules that can be closed company-wide, per role or per person. The contract ledger is the core and always open.
+# A module counts only if all three allow it; actions that belong to a closed module are removed too.
+MODULES = {"projects": "module.projects", "payments": "module.payments", "ai": "ai.use", "audit": "audit.view"}
+MODULE_ACTIONS = {"project.manage": "module.projects", "payment.record": "module.payments"}
 
 def init():
     """Make sure the built-in roles exist (tables: see schema.py)."""
@@ -61,11 +69,35 @@ def roles():
     return out
 
 
+def disabled_modules():
+    """Modules switched off for the whole company (Settings → module management)."""
+    from . import llm
+    return [m for m in (llm.load_config().get("modules_disabled") or []) if m in MODULES]
+
+
+def user_modules_off(user):
+    try:
+        return [m for m in json.loads(user.get("modules_off") or "[]") if m in MODULES]
+    except (TypeError, ValueError):
+        return []
+
+
 def perms_of(user):
     if user.get("role") == "admin":
-        return list(PERMISSIONS)
-    r = role(user.get("role"))
-    return r["permissions"] if r else []
+        perms = list(PERMISSIONS)
+        off = set(disabled_modules())                      # admins are only limited by the company-wide switches
+    else:
+        r = role(user.get("role"))
+        perms = list(r["permissions"]) if r else []
+        off = set(disabled_modules()) | set(user_modules_off(user))
+    closed = {MODULES[m] for m in off}
+    perms = [p for p in perms if p not in closed]
+    return [p for p in perms if MODULE_ACTIONS.get(p) is None or MODULE_ACTIONS[p] in perms]
+
+
+def modules_of(user):
+    perms = perms_of(user)
+    return [m for m, p in MODULES.items() if p in perms]
 
 
 # ---------------- passwords ----------------
@@ -131,6 +163,8 @@ def public_user(u):
     r = role(u.get("role"))
     out["role_name"] = r["name"] if r else u.get("role")
     out["permissions"] = perms_of(u)
+    out["modules"] = modules_of(u)
+    out["modules_off"] = user_modules_off(u)
     out["sees_all"] = u.get("role") == "admin" or bool(dept and dept["see_all"])
     return out
 

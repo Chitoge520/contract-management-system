@@ -26,6 +26,12 @@ ALLOWED = {".pdf", ".docx", ".txt"}
 app = FastAPI(title="Contract Management System")
 admin = require("admin")
 ai_user = require("ai.use")
+projects_user = require("module.projects")
+payments_user = require("module.payments")
+
+
+def _has(user, perm):
+    return perm in auth.perms_of(user)
 
 
 @app.on_event("startup")
@@ -263,7 +269,9 @@ def add_user(body: dict = Body(...), user=Depends(admin)):
     dept_id = body.get("department_id") or None
     if dept_id and not access.department(dept_id):
         raise HTTPException(400, "Department not found")
-    db.ex("UPDATE users SET department_id=?, position=? WHERE id=?", (dept_id, body.get("position") or None, u["id"]))
+    off = sorted({m for m in (body.get("modules_off") or []) if m in auth.MODULES})
+    db.ex("UPDATE users SET department_id=?, position=?, modules_off=? WHERE id=?",
+          (dept_id, body.get("position") or None, json.dumps(off) if off else None, u["id"]))
     u = db.q("SELECT * FROM users WHERE id=?", (u["id"],), one=True)
     auth.log(user, "user_create", detail={"username": u["username"], "role": u["role"], "employee_no": u["employee_no"],
                                           "department": (access.department(dept_id) or {}).get("name"),
@@ -295,6 +303,10 @@ def update_user(uid: int, body: dict = Body(...), user=Depends(admin)):
         changes["employee_no"] = [u.get("employee_no"), new_no]
     if "position" in body and (body["position"] or "") != (u.get("position") or ""):
         changes["position"] = [u.get("position"), body["position"] or None]
+    if "modules_off" in body:
+        off = sorted({m for m in (body.get("modules_off") or []) if m in auth.MODULES})
+        if off != auth.user_modules_off(u):
+            changes["modules_off"] = [auth.user_modules_off(u), off]
     for k in ("ai_daily_questions", "ai_daily_tokens"):
         if k in body:
             v = int(body[k]) if body[k] not in (None, "") else None
@@ -307,7 +319,7 @@ def update_user(uid: int, body: dict = Body(...), user=Depends(admin)):
         if n == 0:
             raise HTTPException(400, "至少需要保留一个可用的管理员 / At least one active admin is required")
     for k, (_, v) in changes.items():
-        db.ex(f"UPDATE users SET {k}=? WHERE id=?", (v, uid))
+        db.ex(f"UPDATE users SET {k}=? WHERE id=?", (json.dumps(v) if k == "modules_off" else v, uid))
     if body.get("password"):
         auth.validate_password(body["password"])
         db.ex("UPDATE users SET password_hash=? WHERE id=?", (auth.hash_password(body["password"]), uid))
@@ -321,6 +333,24 @@ def update_user(uid: int, body: dict = Body(...), user=Depends(admin)):
             shown["department"] = [(access.department(x) or {}).get("name") for x in shown.pop("department_id")]
         auth.log(user, "user_update", detail={"username": u["username"], "changes": shown})
     return auth.public_user(db.q("SELECT * FROM users WHERE id=?", (uid,), one=True))
+
+
+# ================= modules (admin) =================
+@app.get("/api/modules")
+def get_modules(user=Depends(admin)):
+    off = auth.disabled_modules()
+    return {"modules": [{"key": k, "permission": p, "enabled": k not in off} for k, p in auth.MODULES.items()]}
+
+
+@app.put("/api/modules")
+def set_modules(body: dict = Body(...), user=Depends(admin)):
+    """Switch modules on or off for the whole company: {"disabled": ["ai", ...]}"""
+    before = auth.disabled_modules()
+    off = sorted({m for m in (body.get("disabled") or []) if m in auth.MODULES})
+    llm.save_config({"modules_disabled": off})
+    if off != sorted(before):
+        auth.log(user, "modules", detail={"off": off, "was_off": before})
+    return get_modules(user)
 
 
 # ================= roles (admin) =================
@@ -600,7 +630,8 @@ def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "
                    dept: str = "", project: str = "", page: int = 0, page_size: int = 0, user=Depends(current_user)):
     """Newest year first. With page_size the answer is one page: {"total", "page", "page_size", "rows"};
     without it, the whole list (used by the AI assistant's contract picker)."""
-    where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept, project)
+    can_projects, can_payments = _has(user, "module.projects"), _has(user, "module.payments")
+    where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept, project if can_projects else "")
     sql = f"SELECT contracts.*, {YEAR_SQL} AS year, {PROJECT_NAME_SQL} FROM contracts WHERE {where}{CONTRACT_ORDER}"
     total = None
     if page_size > 0:
@@ -611,13 +642,16 @@ def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "
         args = args + [page_size, (page - 1) * page_size]
     found = db.q(sql, args)
     depts = access.departments_map([r["id"] for r in found])
-    pays = payments.summaries([r["id"] for r in found])
+    pays = payments.summaries([r["id"] for r in found]) if can_payments else {}
     words = q.split()
     out = []
     for r in found:
         row = _list_row(r)
         row["departments"] = depts.get(r["id"], [])
         row["payments"] = pays.get(r["id"])
+        if not can_projects:
+            row.pop("project_name", None)
+            row.pop("project_id", None)
         if words:
             row["hits"] = _hits(r["id"], json.loads(r["data_json"]) if r.get("data_json") else {}, words)
         out.append(row)
@@ -667,6 +701,8 @@ def get_contract(cid: int, user=Depends(current_user)):
     row["departments"] = access.departments_of(cid)
     p = db.q("SELECT id, name, code FROM projects WHERE id=?", (row.get("project_id"),), one=True) if row.get("project_id") else None
     row["project"] = p
+    if not _has(user, "module.projects"):
+        row["project"] = row["project_id"] = None
     return row
 
 
@@ -792,7 +828,7 @@ def _project(pid):
 
 
 @app.get("/api/projects")
-def list_projects(user=Depends(current_user)):
+def list_projects(user=Depends(projects_user)):
     """Every project, with figures over the contracts this user may see: contracts, contract value per currency,
     payment progress (complete payments / nodes) and overdue nodes."""
     cond, args = access.visible_sql(user, "contracts")
@@ -848,6 +884,8 @@ def delete_project(pid: int, user=Depends(require("project.manage"))):
 @app.put("/api/contracts/{cid}/project")
 def set_contract_project(cid: int, body: dict = Body(...), user=Depends(require("contract.edit"))):
     """Put a contract into a project (or none). Does not change its review status."""
+    if not _has(user, "module.projects"):
+        raise HTTPException(403, "没有开放项目模块 / The projects module is not available to you")
     row = _get(cid, user)
     pid = body.get("project_id") or None
     if pid is not None:
@@ -881,7 +919,7 @@ def _pay_label(p):
 
 
 @app.get("/api/contracts/{cid}/payments")
-def contract_payments(cid: int, user=Depends(current_user)):
+def contract_payments(cid: int, user=Depends(payments_user)):
     _get(cid, user)
     return {"rows": payments.for_contract(cid), "today": payments.today()}
 
@@ -924,7 +962,7 @@ async def upload_payment_files(pid: int, files: List[UploadFile] = File(...), us
 
 
 @app.get("/api/payment-files/{fid}")
-def get_payment_file(fid: int, download: int = 0, user=Depends(current_user)):
+def get_payment_file(fid: int, download: int = 0, user=Depends(payments_user)):
     f = payments.get_file(fid)
     if not access.can_view(user, f["contract_id"]):
         raise HTTPException(404, "File not found")
@@ -952,7 +990,7 @@ def delete_payment_file(fid: int, user=Depends(pay_user)):
 
 @app.get("/api/payments/contracts")
 def payment_contracts(status: str = "pending", q: str = "", year: str = "", project: str = "", page: int = 1,
-                      page_size: int = 20, user=Depends(current_user)):
+                      page_size: int = 20, user=Depends(payments_user)):
     """Payment tracking grouped by contract: one row per contract that has payment nodes.
     status: pending (something left to pay) / overdue / due30 / incomplete / paid (everything paid) / "" (all)."""
     where, args = _contract_filter(user, year=year, project=project)
@@ -1001,7 +1039,7 @@ def payment_contracts(status: str = "pending", q: str = "", year: str = "", proj
 
 @app.get("/api/payments")
 def payment_tracking(status: str = "", q: str = "", year: str = "", project: str = "", page: int = 1,
-                     page_size: int = 20, user=Depends(current_user)):
+                     page_size: int = 20, user=Depends(payments_user)):
     """Payment nodes of every contract the user may see. status: pending / paid / overdue / due30 (due in 30 days)."""
     where, args = _contract_filter(user, year=year, project=project)
     sql = f"FROM payments p JOIN contracts ON contracts.id=p.contract_id WHERE {where}"
@@ -1062,7 +1100,7 @@ def export_xlsx(ids: str = "", q: str = "", type: str = "", party: str = "", sta
     else:
         where, args = _contract_filter(user, q, type, party, status, lifecycle, year, dept, project)
         rows = db.q(f"SELECT contracts.* FROM contracts WHERE {where}{CONTRACT_ORDER}", args)
-    names = {p["id"]: p["name"] for p in db.q("SELECT id, name FROM projects")}
+    names = {p["id"]: p["name"] for p in db.q("SELECT id, name FROM projects")} if _has(user, "module.projects") else {}
     auth.log(user, "export", detail={"contracts": len(rows)})
     wb = Workbook()
     head_font = Font(bold=True, color="FFFFFF")
@@ -1107,17 +1145,18 @@ def export_xlsx(ids: str = "", q: str = "", type: str = "", party: str = "", sta
                 "数量 Qty", "单位 Unit", "单价 Unit price", "金额 Amount", "币种", "页码 Page"],
           data, [8, 18, 28, 6, 22, 30, 22, 50, 8, 8, 12, 14, 8, 8])
 
-    ws3 = wb.create_sheet("付款 Payments")
+    ws3 = wb.create_sheet("付款 Payments") if _has(user, "module.payments") else None  # only with the payments module
     data = []
-    for r in rows:
+    for r in (rows if ws3 is not None else []):
         for p in payments.export_rows(r["id"]):
             data.append([r["id"], r["contract_no"], r["party_b"]] + p)
-    sheet(ws3, ["合同ID", "合同号 No.", "乙方 Party B", "期次", "付款条件 Trigger", "中文", "比例 %", "计划金额 Planned",
-                "币种", "付款期限 Due rule", "计划日期 Due date", "状态 Status", "实付金额 Paid", "付款日期 Paid on",
-                "备注 Note", "登记人 Recorded by", "凭证数 Proofs", "页码"], data,
-          [8, 18, 28, 6, 40, 30, 8, 14, 8, 36, 12, 14, 14, 12, 30, 12, 8, 6])
+    if ws3 is not None:
+        sheet(ws3, ["合同ID", "合同号 No.", "乙方 Party B", "期次", "付款条件 Trigger", "中文", "比例 %", "计划金额 Planned",
+                  "币种", "付款期限 Due rule", "计划日期 Due date", "状态 Status", "实付金额 Paid", "付款日期 Paid on",
+                  "备注 Note", "登记人 Recorded by", "凭证数 Proofs", "页码"], data,
+            [8, 18, 28, 6, 40, 30, 8, 14, 8, 36, 12, 14, 14, 12, 30, 12, 8, 6])
 
-    for w in (ws, ws2, ws3):
+    for w in [x for x in (ws, ws2, ws3) if x is not None]:
         for row in w.iter_rows(min_row=2):
             for c in row:
                 if isinstance(c.value, float):

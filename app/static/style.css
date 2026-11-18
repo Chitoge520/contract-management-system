@@ -410,3 +410,9 @@ mark { background: #FFE9A8; }
 /* projects */
 .proj-line { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--el-color-primary-dark-2, #0b5d64);
   background: var(--sea-tint, #e6f2f3); border-radius: 4px; padding: 0 6px; margin-top: 3px; }
+
+/* module management */
+.module-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; border-top: 1px solid var(--line-2); }
+.module-row:first-of-type { border-top: 0; }
+.module-checks { display: flex; flex-wrap: wrap; gap: 0 14px; }
+.mb { margin-bottom: 10px; }

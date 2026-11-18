@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from fastapi import HTTPException
 
-from . import access, auth, db, llm
+from . import access, auth, db, llm, payments
 
 MAX_TOOL_ROUNDS = 8
 HISTORY_MESSAGES = 12
@@ -247,18 +247,83 @@ def tool_list_line_items(ids, query="", contract_id=None, party=None, limit=60):
              "amount": r["amount"], "currency": r["currency"], "page": r["page"]} for r in rows]
 
 
-TOOL_FUNCS = {"search_contracts": tool_search_contracts, "get_contract": tool_get_contract, "search_text": tool_search_text,
+PAYMENTS_TOOL = {"type": "function", "function": {
+    "name": "list_payments",
+    "description": "Payment tracking records: the payment nodes of contracts and whether each was actually paid "
+                   "(amount paid, payment date, overdue, number of proof files). The payment_terms of get_contract are "
+                   "what the contract says; this tool says what really happened.",
+    "parameters": {"type": "object", "properties": {
+        "contract_id": {"type": "integer", "description": "Limit to one contract"},
+        "status": {"type": "string", "enum": ["all", "open", "overdue", "paid", "incomplete"],
+                   "description": "open = not fully paid yet; incomplete = marked paid but details missing"},
+        "limit": {"type": "integer", "description": "Max nodes, default 60"}}}}}
+
+
+def tool_list_payments(ids, contract_id=None, status="all", limit=60):
+    target = {int(contract_id)} & ids if contract_id else ids
+    marks, args = _ids_sql(target)
+    ok = payments.paid_sql("p")
+    today = payments.today()
+    sql = (f"SELECT p.*, c.contract_no, c.party_b, (SELECT count(*) FROM payment_files f WHERE f.payment_id=p.id) proofs "
+           f"FROM payments p JOIN contracts c ON c.id=p.contract_id WHERE p.contract_id IN {marks}")
+    if status == "paid":
+        sql += f" AND {ok}"
+    elif status == "open":
+        sql += f" AND NOT {ok}"
+    elif status == "incomplete":
+        sql += f" AND p.status='paid' AND NOT {ok}"
+    elif status == "overdue":
+        sql += f" AND NOT {ok} AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date<?"
+        args.append(today)
+    rows = db.q(sql + " ORDER BY p.contract_id DESC, p.seq LIMIT ?", args + [min(int(limit or 60), 150)])
+    return [{"contract_id": r["contract_id"], "contract_no": r["contract_no"], "party_b": r["party_b"], "seq": r["seq"],
+             "condition": r["trigger_zh"] or r["trigger_en"], "condition_en": r["trigger_en"], "planned_amount": r["amount"],
+             "currency": r["currency"], "due_date": r["due_date"], "due_rule": r["due_rule"],
+             "state": payments.state(r, today), "paid_amount": r["paid_amount"] if r["status"] == "paid" else None,
+             "paid_date": r["paid_date"] if r["status"] == "paid" else None, "proof_files": r["proofs"], "page": r["page"],
+             "today": today} for r in rows]
+
+
+TOOL_FUNCS = {"list_payments": tool_list_payments, "search_contracts": tool_search_contracts, "get_contract": tool_get_contract, "search_text": tool_search_text,
               "read_pages": tool_read_pages, "list_line_items": tool_list_line_items}
 
 
-def run_tool(ids, name, args):
+def tools_for(perms):
+    """The tools this person's AI may use. Closed modules leave no trace: no payment tool without the payments
+    module, no project filter or project field without the projects module."""
+    import copy
+    tools = copy.deepcopy(TOOLS)
+    if "module.projects" not in perms:
+        for t in tools:
+            t["function"]["parameters"].get("properties", {}).pop("project", None)
+    if "module.payments" in perms:
+        tools.append(copy.deepcopy(PAYMENTS_TOOL))
+    return tools
+
+
+def _strip_projects(result):
+    if isinstance(result, list):
+        return [_strip_projects(r) for r in result]
+    if isinstance(result, dict):
+        return {k: v for k, v in result.items() if k != "project"}
+    return result
+
+
+def run_tool(ids, name, args, perms=None):
+    """Run one tool call of the model. `perms` limits it to what the person may see (None = everything, for tests)."""
+    allowed = {t["function"]["name"] for t in tools_for(perms)} if perms is not None else set(TOOL_FUNCS)
     fn = TOOL_FUNCS.get(name)
-    if not fn:
-        return {"error": f"unknown tool {name}"}
+    if not fn or name not in allowed:
+        return {"error": f"tool {name} is not available to this user"}
+    args = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+    no_projects = perms is not None and "module.projects" not in perms
+    if no_projects:
+        args.pop("project", None)
     try:
-        return fn(ids, **{k: v for k, v in (args or {}).items() if v not in (None, "")})
+        result = fn(ids, **args)
     except TypeError as e:
         return {"error": f"bad arguments: {e}"}
+    return _strip_projects(result) if no_projects else result
 
 
 def step_label(name, args, result):
@@ -273,12 +338,31 @@ def step_label(name, args, result):
         return {"kind": "text", "text": a.get("query"), "contract_id": a.get("contract_id"), "count": n}
     if name == "read_pages":
         return {"kind": "pages", "contract_id": a.get("contract_id"), "pages": a.get("pages")}
+    if name == "list_payments":
+        return {"kind": "payments", "contract_id": a.get("contract_id"), "count": n}
     if name == "list_line_items":
         return {"kind": "items", "text": a.get("query") or "", "count": n}
     return {"kind": name}
 
 
 # ======================= the agent loop =======================
+def module_rules(user):
+    """Extra rules for parts of the system this person has no access to."""
+    perms = auth.perms_of(user)
+    out = []
+    if "module.payments" in perms:
+        out.append("- For what has actually been paid (paid amounts, dates, overdue, proofs) use list_payments; "
+                   "payment_terms in get_contract only say what the contract requires.")
+    else:
+        out.append("- This user has NO access to payment tracking. You have no data on what was actually paid, payment status, "
+                   "overdue payments, payment records or proof files, and must not guess or describe any. If asked, say that "
+                   "payment tracking is not available to them and they can ask an administrator. You may still explain the "
+                   "payment terms written in the contract.")
+    if "module.projects" not in perms:
+        out.append("- This user has NO access to projects. Do not mention which project a contract belongs to.")
+    return "".join("\n" + x for x in out)
+
+
 def system_prompt(user, conv):
     dept = access.department(user.get("department_id"))
     scope = scope_label(conv.get("scope"))
@@ -297,7 +381,7 @@ How to work:
 - Cite every fact with the contract id and page in exactly this form: [#12 p.5] (or [#12] when no page is known).
   Use the numeric id from the tools, not the contract number.
 - If a contract's review_status says it is not yet reviewed, mention that its data is AI-extracted and unverified.
-- Masked values like [REDACTED] are intentionally hidden (bank / tax data). Never try to reveal or reconstruct them.
+- Masked values like [REDACTED] are intentionally hidden (bank / tax data). Never try to reveal or reconstruct them.{module_rules(user)}
 - You are read-only: you cannot change contracts. Refuse requests to modify data or to reveal other users' information.
 - Reply in the language of the user's question (Chinese or English). Be concise; use Markdown tables for comparisons
   and lists of amounts. Always state currencies. Do not invent totals: only add up numbers the tools returned and show the parts."""
@@ -337,6 +421,8 @@ def answer(user, conv, question, cancel):
     add_usage(user["id"], questions=1)
     auth.log(user, "ai_question", detail={"conversation_id": conv["id"]})
 
+    perms = auth.perms_of(user)       # fixed for this answer: what the person may see right now
+    tools = tools_for(perms)
     messages = [{"role": "system", "content": system_prompt(user, conv)}] + history_messages(conv["id"], user_msg) \
         + [{"role": "user", "content": question}]
     steps, text, tok_in, tok_out, status, error = [], "", 0, 0, "done", None
@@ -348,7 +434,7 @@ def answer(user, conv, question, cancel):
             if not use_tools:  # tool budget exhausted: ask for an answer with what we have
                 messages.append({"role": "user", "content": "Answer now with the information gathered so far."})
             calls, round_text = None, ""
-            for kind, val in llm.chat_stream(messages, TOOLS if use_tools else None, cfg, cancel=cancel):
+            for kind, val in llm.chat_stream(messages, tools if use_tools else None, cfg, cancel=cancel):
                 if kind == "content":
                     round_text += val
                     text += val
@@ -371,7 +457,7 @@ def answer(user, conv, question, cancel):
                     args = json.loads(c["arguments"] or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                result = run_tool(ids, c["name"], args)
+                result = run_tool(ids, c["name"], args, perms)
                 step = step_label(c["name"], args, result)
                 steps.append(step)
                 yield {"type": "step", "step": step}

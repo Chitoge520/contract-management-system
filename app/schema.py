@@ -329,7 +329,20 @@ def step_projects(c):
             c.execute("UPDATE roles SET permissions=? WHERE key='editor'", (json.dumps(perms + ["project.manage"]),))
 
 
-MIGRATIONS = [step_baseline, step_foreign_keys, step_search_text, step_payments, step_projects]
+# ---------------------------------------------------------------- step 6
+# Module management: modules become role permissions (every existing role keeps what it had),
+# and a person can have modules switched off individually.
+def step_modules(c):
+    if "modules_off" not in _columns(c, "users"):
+        c.execute("ALTER TABLE users ADD COLUMN modules_off TEXT")   # JSON list of module keys, NULL = none
+    for r in c.execute("SELECT key, permissions FROM roles").fetchall():
+        perms = json.loads(r["permissions"] or "[]")
+        add = [p for p in ("module.projects", "module.payments") if p not in perms]
+        if add:
+            c.execute("UPDATE roles SET permissions=? WHERE key=?", (json.dumps(add + perms), r["key"]))
+
+
+MIGRATIONS = [step_baseline, step_foreign_keys, step_search_text, step_payments, step_projects, step_modules]
 LATEST = len(MIGRATIONS)
 
 

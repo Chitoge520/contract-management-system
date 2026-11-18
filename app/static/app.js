@@ -20,7 +20,7 @@ const STATUSES = ['queued', 'reading', 'extracting', 'review', 'confirmed', 'fai
 const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
 const ROLES = ['admin', 'editor', 'viewer'];
-const ACTIONS = ['project', 'project_create', 'project_update', 'project_delete', 'payment_add', 'payment_update', 'payment_delete', 'payment_file_add', 'payment_file_delete', 'register', 'user_approve', 'user_reject', 'ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
+const ACTIONS = ['modules', 'project', 'project_create', 'project_update', 'project_delete', 'payment_add', 'payment_update', 'payment_delete', 'payment_file_add', 'payment_file_delete', 'register', 'user_approve', 'user_reject', 'ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
   'lifecycle_status', 'notes', 'login', 'login_failed', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
 // permission check: 'admin' = administrators; otherwise a permission key such as 'contract.upload'
 const can = p => !!store.user && (p === 'admin' ? store.user.role === 'admin' : (store.user.permissions || []).includes(p));
@@ -142,10 +142,12 @@ const AuditDetail = {
         k === 'department' ? t('department') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
         k === 'position' ? t('position') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
         k === 'employee_no' ? t('employeeNo') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
-        k === 'active' ? (v[1] ? t('enabled') : t('disabled')) : k === 'password' ? t('resetPw') : k).join(', ');
+        k === 'active' ? (v[1] ? t('enabled') : t('disabled')) : k === 'password' ? t('resetPw') :
+        k === 'modules_off' ? t('modulesOffLabel') + ' ' + ((v[1] || []).map(m => t('mod_' + m)).join('、') || '—') : k).join(', ');
       if (r.action === 'payment_update') return d.payment + ': ' + Object.entries(d.changes || {}).map(([k, v]) =>
         k === 'status' ? t('ps_' + v[0]) + '→' + t('ps_' + v[1]) : t('pf_' + k) + ' ' + (v[0] ?? '—') + '→' + (v[1] ?? '—')).join(', ');
       if (r.action === 'payment_add' || r.action === 'payment_delete') return d.payment;
+      if (r.action === 'modules') return (d.off || []).length ? t('modulesNowOff', { m: d.off.map(k => t('mod_' + k)).join('、') }) : t('modulesAllOn');
       if (r.action === 'project') return (d.old || t('noProject')) + ' → ' + (d.new || t('noProject'));
       if (r.action === 'project_create') return d.name + (d.code ? ' · ' + d.code : '');
       if (r.action === 'project_delete') return d.name + (d.contracts ? ' · ' + t('projectDeletedContracts', { n: d.contracts }) : '');
@@ -181,6 +183,12 @@ const AuditDetail = {
 
 // ---------- inputs with restrictions ----------
 // kind: date | num (any number) | pos (>= 0) | pct (0-100) | int (whole number >= 1) | currency (3-letter code)
+// modules that can be closed (company-wide, per role, per person); the contract ledger is always open
+const MODULES = [
+  { key: 'projects', perm: 'module.projects' }, { key: 'payments', perm: 'module.payments' },
+  { key: 'ai', perm: 'ai.use' }, { key: 'audit', perm: 'audit.view' },
+];
+const MODULE_PERMS = MODULES.map(m => m.perm);
 const CURRENCIES = ['CNY', 'USD', 'EUR', 'ILS', 'HKD', 'GBP', 'JPY', 'SGD', 'AED', 'CHF', 'AUD', 'CAD'];
 const FieldInput = {
   mixins: [mixin],
@@ -580,7 +588,7 @@ const ListView = {
           </template></el-table-column>
         <el-table-column :label="t('totalAmount')" width="165" align="right">
           <template #default="{ row }"><span v-if="row.total_amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.total_amount) }}</span></span></template></el-table-column>
-        <el-table-column :label="t('payProgress')" width="90">
+        <el-table-column v-if="can('module.payments')" :label="t('payProgress')" width="90">
           <template #default="{ row }"><template v-if="row.payments">
             <span :class="{ danger: row.payments.overdue }">{{ row.payments.paid }}/{{ row.payments.total }}</span>
             <el-tag v-if="row.payments.overdue" type="danger" size="small" effect="plain" class="ml-xs">{{ t('payOverdue') }}</el-tag>
@@ -1005,7 +1013,7 @@ const ProjectsView = {
         <el-table-column v-if="vw >= 900" :label="t('projectValue')" width="180" align="right">
           <template #default="{ row }"><div v-for="v in row.values" :key="v.currency" class="money"><span class="cur">{{ v.currency }}</span> <span class="amt">{{ fmt(v.total) }}</span></div>
             <span v-if="!row.values.length" class="muted">—</span></template></el-table-column>
-        <el-table-column :label="t('payProgress')" width="130">
+        <el-table-column v-if="can('module.payments')" :label="t('payProgress')" width="130">
           <template #default="{ row }"><template v-if="row.nodes">
             <div class="num" :class="{ danger: row.overdue }">{{ row.paid }} / {{ row.nodes }}</div>
             <el-progress :percentage="Math.round(100 * row.paid / row.nodes)" :show-text="false" :stroke-width="5" :status="row.paid === row.nodes ? 'success' : ''" />
@@ -1013,7 +1021,7 @@ const ProjectsView = {
           </template><span v-else class="muted">—</span></template></el-table-column>
         <el-table-column :width="vw >= 640 ? 230 : 90" align="right">
           <template #default="{ row }">
-            <el-button link type="primary" size="small" @click.stop="go('payments', null, { project: row.id, status: '' })">{{ t('navPayments') }}</el-button>
+            <el-button v-if="can('module.payments')" link type="primary" size="small" @click.stop="go('payments', null, { project: row.id, status: '' })">{{ t('navPayments') }}</el-button>
             <template v-if="can('project.manage')">
               <el-button link size="small" @click.stop="openEdit(row)">{{ t('edit') }}</el-button>
               <el-button link type="danger" size="small" @click.stop="remove(row)">{{ t('remove') }}</el-button>
@@ -1267,7 +1275,7 @@ const DetailView = {
           <span v-if="c.page_count">{{ c.page_count }} {{ t('pages') }}<template v-if="c.ocr_pages"> · {{ c.ocr_pages }} {{ t('ocrPages') }}</template></span>
         </div>
         <div class="meta-row people">
-          <span class="dept-line"><el-icon><FolderOpened /></el-icon>
+          <span v-if="can('module.projects')" class="dept-line"><el-icon><FolderOpened /></el-icon>
             <a v-if="c.project" href="javascript:void 0" @click="go('list', null, { project: c.project.id })">{{ c.project.name }}</a>
             <span v-else class="muted">{{ t('noProject') }}</span>
             <el-button v-if="can('contract.edit')" link type="primary" size="small" @click="openProject">{{ t('changeProject') }}</el-button>
@@ -1396,7 +1404,7 @@ const DetailView = {
 
           <el-tab-pane :label="t('tabPayments')" name="payments">
             <template v-if="d">
-              <PaymentPanel v-if="!editing" :contract-id="c.id" :currency="cur" :working="WORKING.includes(c.status)" />
+              <PaymentPanel v-if="!editing && can('module.payments')" :contract-id="c.id" :currency="cur" :working="WORKING.includes(c.status)" />
               <div class="card"><h2>{{ t('payments') }} <span class="muted" v-if="cur">{{ cur }}</span> <span class="muted small">· {{ t('payAiTermsNote') }}</span></h2>
                 <DataTable :rows="d.payment_terms" :cols="cols.pay" :editing="editing"
                   @add="addRow('payment_terms', { seq: (draft.payment_terms.length + 1) })" @remove="i => removeRow('payment_terms', i)" /></div>
@@ -1547,7 +1555,18 @@ const AuditView = {
 const UsersView = {
   mixins: [mixin],
   setup() {
-    const tab = ref(['users', 'pending', 'roles', 'depts'].includes(store.route.query.tab) ? store.route.query.tab : 'users');
+    const tab = ref(['users', 'pending', 'roles', 'modules', 'depts'].includes(store.route.query.tab) ? store.route.query.tab : 'users');
+    watch(() => store.route.query.tab, v => { if (['users', 'pending', 'roles', 'modules', 'depts'].includes(v)) tab.value = v; });
+    const modules = ref([]);
+    async function loadModules() { try { modules.value = (await api('/api/modules')).modules; } catch (e) { ElMessage.error(e.message); } }
+    onMounted(loadModules);
+    async function setModule(key, on) {
+      const off = modules.value.filter(m => (m.key === key ? !on : !m.enabled)).map(m => m.key);
+      try { modules.value = (await api('/api/modules', { method: 'PUT', json: { disabled: off } })).modules; ElMessage.success(t('saved'));
+        const s = await api('/api/auth/state'); store.user = s.user; }   // my own menu follows
+      catch (e) { ElMessage.error(e.message); }
+    }
+    const actionPerms = computed(() => perms.value.filter(p => !MODULE_PERMS.includes(p)));
     const users = ref([]); const roles = ref([]); const perms = ref([]); const depts = ref([]); const loading = ref(true);
     const pending = ref([]);
     async function loadAll() {
@@ -1567,19 +1586,20 @@ const UsersView = {
     // ---- users ----
     const dlg = ref(false); const busy = ref(false);
     const blank = { id: null, username: '', display_name: '', employee_no: '', role: 'viewer', department_id: null, position: '', active: true,
-      password: '', ai_daily_questions: null, ai_daily_tokens: null };
+      password: '', ai_daily_questions: null, ai_daily_tokens: null, modules_off: [] };
     const form = reactive(Object.assign({}, blank));
     function openNew() { Object.assign(form, blank); dlg.value = true; }
     function openEdit(u) {
       Object.assign(form, blank, { id: u.id, username: u.username, display_name: u.display_name, employee_no: u.employee_no || '', role: u.role,
         department_id: u.department_id, position: u.position || '', active: !!u.active,
-        ai_daily_questions: u.ai_daily_questions, ai_daily_tokens: u.ai_daily_tokens });
+        ai_daily_questions: u.ai_daily_questions, ai_daily_tokens: u.ai_daily_tokens, modules_off: [...(u.modules_off || [])] });
       dlg.value = true;
     }
     async function submit() {
       busy.value = true;
       const body = { display_name: form.display_name, employee_no: form.employee_no.trim(), role: form.role, department_id: form.department_id || null,
-        position: form.position || null, ai_daily_questions: form.ai_daily_questions, ai_daily_tokens: form.ai_daily_tokens };
+        position: form.position || null, ai_daily_questions: form.ai_daily_questions, ai_daily_tokens: form.ai_daily_tokens,
+        modules_off: form.role === 'admin' ? [] : form.modules_off };
       try {
         if (form.id) {
           body.active = form.active;
@@ -1651,8 +1671,8 @@ const UsersView = {
       try { await ElMessageBox.confirm(t('deleteDeptConfirm', { n: d.name }), t('remove'), { type: 'warning', confirmButtonText: t('remove'), cancelButtonText: t('no') }); } catch (e) { return; }
       try { await api('/api/departments/' + d.id, { method: 'DELETE' }); ElMessage.success(t('deleted')); loadAll(); } catch (e) { ElMessageBox.alert(e.message, t('remove'), { type: 'warning' }); }
     }
-    return { tab, users, pending, apDlg, ap, openApprove, approve, reject, roles, perms, depts, loading, dlg, busy, form, openNew, openEdit, submit, suggestPositions,
-      roleDlg, roleForm, newRole, saveRole, togglePerm, roleCmd, deptDlg, deptForm, newDept, editDept, saveDept, toggleSeeAll, deleteDept, store, roleName };
+    return { modules, setModule, actionPerms, MODULES, tab, users, pending, apDlg, ap, openApprove, approve, reject, roles, perms, depts, loading, dlg, busy, form, openNew, openEdit, submit, suggestPositions,
+      roleDlg, roleForm, newRole, saveRole, togglePerm, roleCmd, deptDlg, deptForm, newDept, editDept, saveDept, toggleSeeAll, deleteDept, store, roleName, go };
   },
   template: `
   <div class="users">
@@ -1662,7 +1682,7 @@ const UsersView = {
         <el-button v-if="tab === 'roles'" type="primary" @click="newRole"><el-icon><Plus /></el-icon>{{ t('addRole') }}</el-button>
         <el-button v-if="tab === 'depts'" type="primary" @click="newDept"><el-icon><Plus /></el-icon>{{ t('addDept') }}</el-button>
       </div></div>
-    <el-tabs v-model="tab" v-loading="loading">
+    <el-tabs v-model="tab" v-loading="loading" @tab-change="name => { if (store.route.query.tab !== name) go('users', null, { tab: name }); }">
       <el-tab-pane :label="t('tabUsers')" name="users">
         <div class="panel">
           <el-table :data="users" style="width:100%">
@@ -1670,7 +1690,9 @@ const UsersView = {
               <span v-if="row.employee_no" class="mono-ish">{{ row.employee_no }}</span>
               <el-tooltip v-else :content="t('noEmpTip', { u: row.username })"><el-tag type="warning" size="small" effect="plain">{{ t('noEmp') }}</el-tag></el-tooltip>
             </template></el-table-column>
-            <el-table-column :label="t('displayName')" prop="display_name" min-width="110" />
+            <el-table-column :label="t('displayName')" min-width="110"><template #default="{ row }">{{ row.display_name }}
+              <el-tooltip v-if="(row.modules_off || []).length" :content="t('modulesOffList', { m: row.modules_off.map(k => t('mod_' + k)).join('、') })">
+                <el-tag size="small" type="info" effect="plain" class="ml-xs">{{ t('modulesOffN', { n: row.modules_off.length }) }}</el-tag></el-tooltip></template></el-table-column>
             <el-table-column :label="t('department')" min-width="120"><template #default="{ row }">{{ row.department_name || '—' }}</template></el-table-column>
             <el-table-column :label="t('position')" min-width="110"><template #default="{ row }">{{ row.position || '—' }}</template></el-table-column>
             <el-table-column :label="t('role')" width="120"><template #default="{ row }">
@@ -1702,7 +1724,7 @@ const UsersView = {
       <el-tab-pane :label="t('tabRoles')" name="roles">
         <p class="note">{{ t('rolesHelp') }}</p>
         <div class="panel">
-          <el-table :data="perms" style="width:100%" class="perm-matrix">
+          <el-table :data="actionPerms" style="width:100%" class="perm-matrix">
             <el-table-column :label="t('permission')" min-width="220" fixed>
               <template #default="{ row }"><div>{{ t('p_' + row) }}</div><div class="muted small">{{ t('pd_' + row) }}</div></template></el-table-column>
             <el-table-column v-for="r in roles" :key="r.key" min-width="120" align="center">
@@ -1726,6 +1748,34 @@ const UsersView = {
           </el-table>
         </div>
         <p class="note mt-s">{{ t('adminOnlyHelp') }}</p>
+      </el-tab-pane>
+
+      <el-tab-pane :label="t('tabModules')" name="modules">
+        <p class="note">{{ t('modulesHelp') }}</p>
+        <div class="card">
+          <h2>{{ t('modulesCompany') }}</h2>
+          <div class="muted small mb">{{ t('modulesCompanyHelp') }}</div>
+          <div v-for="m in modules" :key="m.key" class="module-row">
+            <div><div class="t-title">{{ t('mod_' + m.key) }}</div><div class="muted small">{{ t('modd_' + m.key) }}</div></div>
+            <el-switch :model-value="m.enabled" @change="v => setModule(m.key, v)" :active-text="m.enabled ? t('modOn') : t('modOff')" />
+          </div>
+        </div>
+        <div class="card">
+          <h2>{{ t('modulesByRole') }}</h2>
+          <div class="muted small mb">{{ t('modulesByRoleHelp') }}</div>
+          <el-table :data="MODULES" style="width:100%" class="perm-matrix">
+            <el-table-column :label="t('module')" min-width="200" fixed>
+              <template #default="{ row }"><div>{{ t('mod_' + row.key) }}</div>
+                <div v-if="modules.find(m => m.key === row.key && !m.enabled)" class="small warn">{{ t('modOffCompany') }}</div></template></el-table-column>
+            <el-table-column v-for="r in roles" :key="r.key" min-width="110" align="center">
+              <template #header><div>{{ roleName(r.key) }}</div><div class="muted small">{{ t('nUsers', { n: r.users }) }}</div></template>
+              <template #default="{ row }">
+                <el-checkbox :model-value="r.permissions.includes(row.perm)" :disabled="r.key === 'admin'" @change="v => togglePerm(r, row.perm, v)" />
+              </template>
+            </el-table-column>
+          </el-table>
+          <div class="muted small mt-s">{{ t('modulesPersonHelp') }}</div>
+        </div>
       </el-tab-pane>
 
       <el-tab-pane :label="t('tabDepts')" name="depts">
@@ -1768,6 +1818,12 @@ const UsersView = {
             <el-input-number v-model="form.ai_daily_tokens" :min="0" :max="100000000" :step="10000" :controls="false" :placeholder="t('useDefault')" />
             <span class="muted small">{{ t('tokensPerDay') }}</span>
           </div></el-form-item>
+        <el-form-item v-if="form.role !== 'admin'" :label="t('modulesOffLabel')">
+          <el-checkbox-group v-model="form.modules_off" class="module-checks">
+            <el-checkbox v-for="m in MODULES" :key="m.key" :value="m.key">{{ t('mod_' + m.key) }}</el-checkbox>
+          </el-checkbox-group>
+          <div class="rule">• {{ t('modulesOffHelp') }}</div>
+        </el-form-item>
       </el-form>
       <template #footer><el-button @click="dlg = false">{{ t('cancel') }}</el-button><el-button type="primary" :loading="busy" @click="submit">{{ t('save') }}</el-button></template>
     </el-dialog>
@@ -1822,6 +1878,7 @@ function stepText(s) {
   if (s.kind === 'contract') return t('st_contract', { id: s.contract_id });
   if (s.kind === 'text') return t('st_text', { q: s.text || '', n: s.count == null ? '?' : s.count });
   if (s.kind === 'pages') return t('st_pages', { id: s.contract_id, p: (s.pages || []).join(', ') });
+  if (s.kind === 'payments') return t('st_payments', { n: s.count == null ? '?' : s.count });
   if (s.kind === 'items') return t('st_items', { q: s.text || t('all'), n: s.count == null ? '?' : s.count });
   return s.kind;
 }
@@ -2140,7 +2197,13 @@ const Root = {
     }
     watch(() => store.user && store.user.id, pollPending);
     const pendingTimer = setInterval(pollPending, 60000);
-    onBeforeUnmount(() => clearInterval(pendingTimer));
+    // modules or permissions changed by an administrator take effect in open pages within a minute
+    async function refreshMe() {
+      if (!store.user) return;
+      try { const st = await api('/api/auth/state'); if (st.user) store.user = st.user; } catch (e) {}
+    }
+    const meTimer = setInterval(refreshMe, 60000);
+    onBeforeUnmount(() => { clearInterval(pendingTimer); clearInterval(meTimer); });
     function toggleLang() {
       store.lang = store.lang === 'zh' ? 'en' : 'zh';
       try { localStorage.setItem('cms_lang', store.lang); } catch (e) {}
@@ -2164,6 +2227,8 @@ const Root = {
       if ((n === 'users' || n === 'settings') && !can('admin')) return false;
       if (n === 'audit' && !can('audit.view')) return false;
       if (n === 'ai' && !can('ai.use')) return false;
+      if (n === 'projects' && !can('module.projects')) return false;
+      if (n === 'payments' && !can('module.payments')) return false;
       return true;
     });
     return { store, epLocale, toggleLang, active, go, onUserCmd, pwDlg, pw, changePw, allowed };
@@ -2178,8 +2243,8 @@ const Root = {
             <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
           <el-menu :default-active="active" @select="k => go(k)" background-color="transparent" text-color="#C9D3DD" active-text-color="#ffffff" class="nav-menu">
             <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
-            <el-menu-item index="projects"><el-icon><FolderOpened /></el-icon><span>{{ t('navProjects') }}</span></el-menu-item>
-            <el-menu-item index="payments"><el-icon><Wallet /></el-icon><span>{{ t('navPayments') }}</span></el-menu-item>
+            <el-menu-item v-if="can('module.projects')" index="projects"><el-icon><FolderOpened /></el-icon><span>{{ t('navProjects') }}</span></el-menu-item>
+            <el-menu-item v-if="can('module.payments')" index="payments"><el-icon><Wallet /></el-icon><span>{{ t('navPayments') }}</span></el-menu-item>
             <el-menu-item v-if="can('ai.use')" index="ai"><el-icon><ChatDotRound /></el-icon><span>{{ t('navAI') }}</span></el-menu-item>
             <el-menu-item v-if="can('audit.view')" index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
             <el-menu-item v-if="can('admin')" index="users"><el-icon><User /></el-icon><span>{{ t('navUsers') }}</span>
