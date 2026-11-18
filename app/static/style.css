@@ -289,3 +289,28 @@ mark { background: #FFE9A8; }
 
 /* contract list paging */
 .pager { display: flex; justify-content: flex-end; margin-top: 12px; overflow-x: auto; }
+
+/* payments */
+.card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
+.card-head h2 { margin-bottom: 2px; }
+.pay-sum { display: flex; flex-wrap: wrap; gap: 28px; padding: 10px 0 14px; }
+.pay-sum .k { font-size: 12px; color: var(--el-text-color-secondary, #8a94a3); }
+.pay-sum .v { font-size: 18px; font-weight: 600; margin-top: 2px; }
+.danger { color: var(--el-color-danger, #d64545); }
+.el-table .row-overdue td { background: #fff6f6; }
+.pay-empty { padding: 10px 0; }
+.pay-status-row { margin-bottom: 18px; }
+.pay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+.proof-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; flex-wrap: wrap; }
+.proof-row a { word-break: break-all; }
+.proof-upload { margin-top: 8px; }
+.proof-link a { display: inline-flex; align-items: center; gap: 3px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ml-xs { margin-left: 4px; }
+.fl { float: left; }
+@media (max-width: 640px) { .pay-grid { grid-template-columns: 1fr; } }
+
+/* restricted inputs */
+.num-field { display: flex; align-items: center; gap: 6px; width: 100%; }
+.num-field .el-input-number { flex: 1; }
+.num-field .el-input-number .el-input__inner { text-align: left; }
+.num-append { color: var(--el-text-color-secondary, #8a94a3); font-size: 13px; flex: none; }

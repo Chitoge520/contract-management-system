@@ -18,7 +18,7 @@ const STATUSES = ['queued', 'reading', 'extracting', 'review', 'confirmed', 'fai
 const LIFECYCLES = ['draft', 'active', 'completed', 'terminated'];
 const WORKING = ['queued', 'reading', 'extracting'];
 const ROLES = ['admin', 'editor', 'viewer'];
-const ACTIONS = ['register', 'user_approve', 'user_reject', 'ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
+const ACTIONS = ['payment_add', 'payment_update', 'payment_delete', 'payment_file_add', 'payment_file_delete', 'register', 'user_approve', 'user_reject', 'ai_question', 'upload', 'departments', 'dept_create', 'dept_update', 'dept_delete', 'role_create', 'role_update', 'role_delete', 'extracted', 'extract_failed', 'edit', 'confirm', 'unconfirm', 'reextract', 'reread', 'delete',
   'lifecycle_status', 'notes', 'login', 'login_failed', 'setup', 'user_create', 'user_update', 'password_change', 'settings', 'export', 'backup'];
 // permission check: 'admin' = administrators; otherwise a permission key such as 'contract.upload'
 const can = p => !!store.user && (p === 'admin' ? store.user.role === 'admin' : (store.user.permissions || []).includes(p));
@@ -70,7 +70,7 @@ function parseHash() {
   if (m) return { name: 'detail', id: Number(m[1]), query };
   const ma = h.match(/^ai(?:\/(\d+))?/);
   if (ma) return { name: 'ai', id: ma[1] ? Number(ma[1]) : null, query };
-  for (const n of ['audit', 'users', 'settings']) if (h.startsWith(n)) return { name: n, id: null, query };
+  for (const n of ['audit', 'users', 'settings', 'payments']) if (h.startsWith(n)) return { name: n, id: null, query };
   return { name: 'list', id: null, query };
 }
 function pathLabel(path) {
@@ -141,6 +141,10 @@ const AuditDetail = {
         k === 'position' ? t('position') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
         k === 'employee_no' ? t('employeeNo') + ' ' + (v[0] || '—') + '→' + (v[1] || '—') :
         k === 'active' ? (v[1] ? t('enabled') : t('disabled')) : k === 'password' ? t('resetPw') : k).join(', ');
+      if (r.action === 'payment_update') return d.payment + ': ' + Object.entries(d.changes || {}).map(([k, v]) =>
+        k === 'status' ? t('ps_' + v[0]) + '→' + t('ps_' + v[1]) : t('pf_' + k) + ' ' + (v[0] ?? '—') + '→' + (v[1] ?? '—')).join(', ');
+      if (r.action === 'payment_add' || r.action === 'payment_delete') return d.payment;
+      if (r.action === 'payment_file_add' || r.action === 'payment_file_delete') return d.payment + ' · ' + d.file;
       if (r.action === 'extracted') return (d.model || '') + (d.items != null ? ' · ' + d.items + ' items' : '');
       if (r.action === 'extract_failed') return d.error;
       if (r.action === 'upload' || r.action === 'delete') return d.file === r.contract_label ? '' : d.file;
@@ -169,8 +173,50 @@ const AuditDetail = {
   </div>`,
 };
 
+// ---------- inputs with restrictions ----------
+// kind: date | num (any number) | pos (>= 0) | pct (0-100) | int (whole number >= 1) | currency (3-letter code)
+const CURRENCIES = ['CNY', 'USD', 'EUR', 'ILS', 'HKD', 'GBP', 'JPY', 'SGD', 'AED', 'CHF', 'AUD', 'CAD'];
+const FieldInput = {
+  mixins: [mixin],
+  props: { modelValue: null, kind: String, placeholder: String, append: String, size: String },
+  emits: ['update:modelValue'],
+  setup(props, { emit }) {
+    const numVal = computed(() => {
+      const v = props.modelValue;
+      if (v === null || v === undefined || v === '') return null;
+      const x = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.\-]/g, ''));
+      return isNaN(x) ? null : x;
+    });
+    const dateVal = computed(() => /^\d{4}-\d{2}-\d{2}$/.test(props.modelValue || '') ? props.modelValue : null);
+    const legacyText = computed(() => props.kind === 'date' && props.modelValue && !dateVal.value ? props.modelValue : '');
+    function setNum(v) { emit('update:modelValue', v === undefined || v === null || Number.isNaN(v) ? null : v); }
+    function setCurrency(v) {
+      const c = String(v || '').trim().toUpperCase();
+      if (c && !/^[A-Z]{3}$/.test(c)) { ElMessage.error(t('currencyRule')); return; }
+      emit('update:modelValue', c || null);
+    }
+    const limits = computed(() => ({
+      num: { min: -1e13, max: 1e13 }, pos: { min: 0, max: 1e13 }, pct: { min: 0, max: 100 }, int: { min: 1, max: 100000, step: 1, precision: 0 },
+    }[props.kind] || {}));
+    return { numVal, dateVal, legacyText, setNum, setCurrency, limits, CURRENCIES, emit };
+  },
+  template: `
+  <el-date-picker v-if="kind === 'date'" :model-value="dateVal" @update:model-value="v => emit('update:modelValue', v || null)"
+    type="date" value-format="YYYY-MM-DD" :placeholder="legacyText || placeholder || 'YYYY-MM-DD'" :size="size" clearable style="width:100%" />
+  <el-select v-else-if="kind === 'currency'" :model-value="modelValue || ''" @update:model-value="setCurrency" filterable allow-create
+    default-first-option clearable :placeholder="placeholder || t('currency')" :size="size" style="width:100%">
+    <el-option v-for="c in CURRENCIES" :key="c" :value="c" :label="c" /></el-select>
+  <div v-else-if="['num', 'pos', 'pct', 'int'].includes(kind)" class="num-field">
+    <el-input-number :model-value="numVal" @update:model-value="setNum" :min="limits.min" :max="limits.max" :step="limits.step || 1"
+      :precision="limits.precision" :controls="kind === 'int'" controls-position="right" :value-on-clear="null"
+      :placeholder="placeholder" :size="size" style="width:100%" />
+    <span v-if="kind === 'pct' || append" class="num-append">{{ kind === 'pct' ? '%' : append }}</span>
+  </div>
+  <el-input v-else :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)" :placeholder="placeholder" :size="size" />`,
+};
+
 const DataTable = {
-  mixins: [mixin], components: { PageRef },
+  mixins: [mixin], components: { PageRef, FieldInput },
   props: { rows: Array, cols: Array, editing: Boolean, emptyText: String, highlightIndex: { type: Number, default: -1 } },
   emits: ['add', 'remove'],
   computed: {
@@ -186,11 +232,11 @@ const DataTable = {
       <el-table-column v-for="c in shownCols" :key="c.key + (c.type||'')" :label="c.label" :width="c.width" :min-width="c.min"
         :align="c.type === 'num' ? 'right' : 'left'">
         <template #default="{ row }">
-          <template v-if="editing && c.type !== 'page'">
-            <el-input v-if="c.type === 'long'" v-model="row[c.key]" type="textarea" :autosize="{minRows:1,maxRows:5}" />
+          <template v-if="editing">
+            <FieldInput v-if="c.input || c.type === 'page'" v-model="row[c.key]" :kind="c.input || 'int'" size="small" />
+            <el-input v-else-if="c.type === 'long'" v-model="row[c.key]" type="textarea" :autosize="{minRows:1,maxRows:5}" />
             <el-input v-else v-model="row[c.key]" />
           </template>
-          <template v-else-if="editing && c.type === 'page'"><el-input v-model.number="row[c.key]" /></template>
           <PageRef v-else-if="c.type === 'page'" :p="row[c.key]" />
           <span v-else-if="c.type === 'num'" class="num">{{ fmt(row[c.key]) }}</span>
           <div v-else-if="c.type === 'item'"><div class="t-title">{{ row.name }}</div>
@@ -520,6 +566,11 @@ const ListView = {
           </template></el-table-column>
         <el-table-column :label="t('totalAmount')" width="170" align="right">
           <template #default="{ row }"><span class="num">{{ fmt(row.total_amount, row.currency) }}</span></template></el-table-column>
+        <el-table-column :label="t('payProgress')" width="100">
+          <template #default="{ row }"><template v-if="row.payments">
+            <span :class="{ danger: row.payments.overdue }">{{ row.payments.paid }}/{{ row.payments.total }}</span>
+            <el-tag v-if="row.payments.overdue" type="danger" size="small" effect="plain" class="ml-xs">{{ t('payOverdue') }}</el-tag>
+          </template></template></el-table-column>
         <el-table-column :label="t('signingDate')" width="110">
           <template #default="{ row }">{{ row.signing_date || row.effective_date || '—' }}</template></el-table-column>
         <el-table-column :label="t('status')" width="120">
@@ -550,9 +601,257 @@ const ListView = {
   </div>`,
 };
 
+// ---------- payments ----------
+const PAY_FIELDS = { seq: null, trigger_zh: '', trigger_en: '', percentage: null, amount: null, currency: '', due_rule: '',
+  due_date: '', status: 'pending', paid_amount: null, paid_date: '', note: '' };
+function todayStr() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+function payOverdue(p, today) { return p.status !== 'paid' && p.due_date && p.due_date < (today || todayStr()); }
+function payLabel(p) { return (store.lang === 'zh' ? (p.trigger_zh || p.trigger_en) : (p.trigger_en || p.trigger_zh)) || '—'; }
+function fileSize(n) { return n == null ? '' : n < 1024 * 1024 ? Math.max(1, Math.round(n / 1024)) + ' KB' : (n / 1024 / 1024).toFixed(1) + ' MB'; }
+function sumsByCurrency(rows, key) {
+  const out = {};
+  rows.forEach(r => { const v = num(r[key]); if (v !== null) { const c = r.currency || ''; out[c] = (out[c] || 0) + v; } });
+  return Object.entries(out).map(([c, v]) => fmt(Math.round(v * 100) / 100, c)).join(' + ') || '—';
+}
+
+// record dialog, shared by the contract page and the tracking page
+const PaymentDialog = {
+  mixins: [mixin], components: { FieldInput }, props: ['modelValue', 'payment', 'contractId', 'currency'], emits: ['update:modelValue', 'saved'],
+  setup(props, { emit }) {
+    const f = reactive({ ...PAY_FIELDS }); const saving = ref(false); const files = ref([]); const pid = ref(null);
+    const uploader = ref(null);
+    watch(() => props.modelValue, open => {
+      if (!open) return;
+      const p = props.payment || {};
+      Object.keys(PAY_FIELDS).forEach(k => { f[k] = p[k] !== undefined && p[k] !== null ? p[k] : PAY_FIELDS[k]; });
+      if (!p.id && !f.currency) f.currency = props.currency || '';
+      pid.value = p.id || null; files.value = (p.files || []).slice();
+    });
+    function setPaid(v) {
+      f.status = v;
+      if (v === 'paid') { if (f.paid_amount === null || f.paid_amount === '') f.paid_amount = f.amount; if (!f.paid_date) f.paid_date = todayStr(); }
+    }
+    async function save() {
+      saving.value = true;
+      try {
+        const body = { ...f };
+        const r = pid.value ? await api('/api/payments/' + pid.value, { method: 'PUT', json: body })
+          : await api('/api/contracts/' + props.contractId + '/payments', { method: 'POST', json: body });
+        ElMessage.success(t('saved'));
+        if (!pid.value) { pid.value = r.id; emit('saved'); return; }  // stay open so proof can be uploaded
+        emit('saved'); emit('update:modelValue', false);
+      } catch (e) { ElMessage.error(e.message); }
+      saving.value = false;
+    }
+    function onUploaded(res) { files.value.push(...res); emit('saved'); }
+    function onUploadError(err) {
+      let msg = String(err && err.message || err);
+      try { msg = JSON.parse(msg).detail || msg; } catch (e) {}
+      ElMessage.error(msg);
+    }
+    async function removeFile(fl) {
+      try { await ElMessageBox.confirm(t('payFileDeleteConfirm'), { type: 'warning' }); } catch (e) { return; }
+      try { await api('/api/payment-files/' + fl.id, { method: 'DELETE' }); files.value = files.value.filter(x => x.id !== fl.id); emit('saved'); }
+      catch (e) { ElMessage.error(e.message); }
+    }
+    async function removeNode() {
+      try { await ElMessageBox.confirm(t('payDeleteConfirm'), { type: 'warning' }); } catch (e) { return; }
+      try { await api('/api/payments/' + pid.value, { method: 'DELETE' }); emit('saved'); emit('update:modelValue', false); }
+      catch (e) { ElMessage.error(e.message); }
+    }
+    return { f, saving, files, pid, uploader, setPaid, save, onUploaded, onUploadError, removeFile, removeNode, fileSize, emit };
+  },
+  template: `
+  <el-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)" :title="pid ? t('payEditTitle') : t('payNewTitle')" width="640px" @closed="saving = false">
+    <el-form label-width="130px" label-position="left" class="pay-form" @submit.prevent>
+      <div class="pay-status-row">
+        <el-radio-group :model-value="f.status" @update:model-value="setPaid" size="large">
+          <el-radio-button value="pending">{{ t('ps_pending') }}</el-radio-button>
+          <el-radio-button value="paid">{{ t('ps_paid') }}</el-radio-button>
+        </el-radio-group>
+      </div>
+      <template v-if="f.status === 'paid'">
+        <el-form-item :label="t('payPaidAmount')"><FieldInput v-model="f.paid_amount" kind="pos" :append="f.currency" /></el-form-item>
+        <el-form-item :label="t('payPaidDate')"><FieldInput v-model="f.paid_date" kind="date" /></el-form-item>
+      </template>
+      <el-form-item :label="t('payNote')"><el-input v-model="f.note" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }" /></el-form-item>
+      <el-divider content-position="left">{{ t('payNodeInfo') }}</el-divider>
+      <el-form-item :label="t('paySeq')"><div style="width:140px"><FieldInput v-model="f.seq" kind="int" /></div></el-form-item>
+      <el-form-item :label="t('payConditionZh')"><el-input v-model="f.trigger_zh" /></el-form-item>
+      <el-form-item :label="t('payConditionEn')"><el-input v-model="f.trigger_en" /></el-form-item>
+      <div class="pay-grid">
+        <el-form-item :label="t('payPct')"><FieldInput v-model="f.percentage" kind="pct" /></el-form-item>
+        <el-form-item :label="t('payPlanned')"><FieldInput v-model="f.amount" kind="pos" :append="f.currency" /></el-form-item>
+      </div>
+      <div class="pay-grid">
+        <el-form-item :label="t('currency')"><FieldInput v-model="f.currency" kind="currency" /></el-form-item>
+        <el-form-item :label="t('payDue')"><FieldInput v-model="f.due_date" kind="date" /></el-form-item>
+      </div>
+      <el-form-item :label="t('payDueRule')"><el-input v-model="f.due_rule" /></el-form-item>
+      <el-divider content-position="left">{{ t('payProof') }}</el-divider>
+      <div v-if="!pid" class="muted small">{{ t('paySaveFirst') }}</div>
+      <template v-else>
+        <div v-for="fl in files" :key="fl.id" class="proof-row">
+          <el-icon><Paperclip /></el-icon>
+          <a :href="'/api/payment-files/' + fl.id" target="_blank" rel="noopener">{{ fl.file_name }}</a>
+          <span class="muted small">{{ fileSize(fl.size) }} · {{ fl.uploaded_by }} · {{ (fl.uploaded_at || '').slice(0, 16) }}</span>
+          <a class="muted small" :href="'/api/payment-files/' + fl.id + '?download=1'">{{ t('download') }}</a>
+          <el-button link type="danger" size="small" @click="removeFile(fl)"><el-icon><Delete /></el-icon></el-button>
+        </div>
+        <el-upload ref="uploader" drag multiple :action="'/api/payments/' + pid + '/files'" name="files" :show-file-list="false"
+          accept=".pdf,.png,.jpg,.jpeg,.webp,.docx,.xlsx" :on-success="onUploaded" :on-error="onUploadError" class="proof-upload">
+          <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+          <div class="el-upload__text">{{ t('payProofHint') }}</div>
+        </el-upload>
+      </template>
+    </el-form>
+    <template #footer>
+      <el-button v-if="pid" type="danger" plain class="fl" @click="removeNode">{{ t('payDelete') }}</el-button>
+      <el-button @click="emit('update:modelValue', false)">{{ t('close') }}</el-button>
+      <el-button type="primary" :loading="saving" @click="save">{{ t('save') }}</el-button>
+    </template>
+  </el-dialog>`,
+};
+
+// payment execution on the contract page
+const PaymentPanel = {
+  mixins: [mixin], components: { PageRef, PaymentDialog }, props: ['contractId', 'currency', 'working'],
+  setup(props) {
+    const rows = ref([]); const today = ref(todayStr()); const loading = ref(true);
+    const dlg = ref(false); const current = ref(null);
+    async function load() {
+      try { const r = await api('/api/contracts/' + props.contractId + '/payments'); rows.value = r.rows; today.value = r.today; }
+      catch (e) { ElMessage.error(e.message); }
+      loading.value = false;
+    }
+    onMounted(load);
+    watch(() => props.working, (now, before) => { if (before && !now) load(); });  // AI finished: nodes may have changed
+    const paid = computed(() => rows.value.filter(r => r.status === 'paid'));
+    const overdue = computed(() => rows.value.filter(r => payOverdue(r, today.value)).length);
+    function open(p) { current.value = p; dlg.value = true; }
+    return { rows, today, loading, dlg, current, paid, overdue, open, load, payOverdue, payLabel, sumsByCurrency };
+  },
+  template: `
+  <div class="card" v-loading="loading">
+    <div class="card-head">
+      <div><h2>{{ t('payExec') }}</h2><div class="muted small">{{ t('payExecSub') }}</div></div>
+      <el-button v-if="can('payment.record')" size="small" @click="open(null)"><el-icon><Plus /></el-icon>{{ t('payAdd') }}</el-button>
+    </div>
+    <div v-if="rows.length" class="pay-sum">
+      <div><div class="k">{{ t('payProgress') }}</div><div class="v">{{ paid.length }} / {{ rows.length }}</div></div>
+      <div><div class="k">{{ t('payPlannedTotal') }}</div><div class="v num">{{ sumsByCurrency(rows, 'amount') }}</div></div>
+      <div><div class="k">{{ t('payPaidTotal') }}</div><div class="v num">{{ sumsByCurrency(paid, 'paid_amount') }}</div></div>
+      <div v-if="overdue"><div class="k">{{ t('payOverdue') }}</div><div class="v danger">{{ overdue }}</div></div>
+    </div>
+    <el-table v-if="rows.length" :data="rows" size="small" style="width:100%" :row-class-name="({ row }) => payOverdue(row, today) ? 'row-overdue' : ''">
+      <el-table-column :label="t('paySeq')" width="56" prop="seq" />
+      <el-table-column :label="t('payCondition')" min-width="220">
+        <template #default="{ row }">
+          <div>{{ payLabel(row) }} <PageRef :p="row.page" /></div>
+          <div class="muted small" v-if="row.due_rule">{{ row.due_rule }}</div>
+          <div class="muted small" v-if="row.note">{{ t('payNote') }}：{{ row.note }}</div>
+        </template></el-table-column>
+      <el-table-column :label="t('payPct')" width="70" align="right"><template #default="{ row }">{{ row.percentage != null ? row.percentage + '%' : '' }}</template></el-table-column>
+      <el-table-column :label="t('payPlanned')" width="140" align="right"><template #default="{ row }"><span class="num">{{ fmt(row.amount, row.currency) }}</span></template></el-table-column>
+      <el-table-column :label="t('payDue')" width="110"><template #default="{ row }"><span :class="{ danger: payOverdue(row, today) }">{{ row.due_date || '—' }}</span></template></el-table-column>
+      <el-table-column :label="t('payStatus')" width="100">
+        <template #default="{ row }">
+          <el-tag v-if="row.status === 'paid'" type="success" size="small">{{ t('ps_paid') }}</el-tag>
+          <el-tag v-else-if="payOverdue(row, today)" type="danger" size="small">{{ t('payOverdue') }}</el-tag>
+          <el-tag v-else type="info" size="small">{{ t('ps_pending') }}</el-tag>
+        </template></el-table-column>
+      <el-table-column :label="t('payPaid')" width="150">
+        <template #default="{ row }"><template v-if="row.status === 'paid'">
+          <div class="num">{{ fmt(row.paid_amount, row.currency) }}</div><div class="muted small">{{ row.paid_date }}</div></template></template></el-table-column>
+      <el-table-column :label="t('payProof')" width="160">
+        <template #default="{ row }">
+          <div v-for="fl in row.files" :key="fl.id" class="proof-link"><a :href="'/api/payment-files/' + fl.id" target="_blank" rel="noopener" :title="fl.file_name"><el-icon><Paperclip /></el-icon>{{ fl.file_name }}</a></div>
+        </template></el-table-column>
+      <el-table-column v-if="can('payment.record')" width="80" align="right">
+        <template #default="{ row }"><el-button size="small" :type="row.status === 'paid' ? '' : 'primary'" plain @click="open(row)">{{ t('payRecord') }}</el-button></template></el-table-column>
+    </el-table>
+    <div v-else-if="!loading" class="muted small pay-empty">{{ working ? t('payWaitAI') : t('payNone') }}</div>
+    <PaymentDialog v-model="dlg" :payment="current" :contract-id="contractId" :currency="currency" @saved="load" />
+  </div>`,
+};
+
+// all payment nodes the user may see
+const PaymentsView = {
+  mixins: [mixin], components: { PaymentDialog },
+  setup() {
+    const f = reactive({ status: store.route.query.status || 'pending', q: '', year: '' });
+    const rows = ref([]); const total = ref(0); const page = ref(1); const pageSize = ref(20); const today = ref(todayStr());
+    const loading = ref(true); const years = ref([]); const dlg = ref(false); const current = ref(null);
+    let debounce = null, seq = 0;
+    async function load() {
+      const my = ++seq;
+      const p = new URLSearchParams({ page: page.value, page_size: pageSize.value });
+      for (const k in f) if (f[k]) p.set(k, f[k]);
+      try {
+        const r = await api('/api/payments?' + p.toString());
+        if (my !== seq) return;
+        rows.value = r.rows; total.value = r.total; today.value = r.today;
+      } catch (e) { ElMessage.error(e.message); }
+      loading.value = false;
+    }
+    api('/api/stats').then(s => { years.value = s.years; }).catch(() => {});
+    function firstPage() { page.value = 1; load(); }
+    watch(() => [f.status, f.year], firstPage);
+    watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(firstPage, 300); });
+    onMounted(load);
+    function contractLabel(r) { return r.contract_no || (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || ('#' + r.contract_id); }
+    async function open(r) {
+      try { const d = await api('/api/contracts/' + r.contract_id + '/payments'); current.value = d.rows.find(x => x.id === r.id) || r; dlg.value = true; }
+      catch (e) { ElMessage.error(e.message); }
+    }
+    function onPage(n) { page.value = n; load(); window.scrollTo(0, 0); }
+    return { f, rows, total, page, pageSize, today, loading, years, dlg, current, load, firstPage, contractLabel, open, onPage, go, payOverdue, payLabel };
+  },
+  template: `
+  <div>
+    <div class="ph"><div><h1>{{ t('navPayments') }}</h1><div class="sub">{{ t('paymentsSub') }}</div></div></div>
+    <div class="filters">
+      <el-radio-group v-model="f.status">
+        <el-radio-button value="pending">{{ t('ps_pending') }}</el-radio-button>
+        <el-radio-button value="overdue">{{ t('payOverdue') }}</el-radio-button>
+        <el-radio-button value="due30">{{ t('payDue30') }}</el-radio-button>
+        <el-radio-button value="paid">{{ t('ps_paid') }}</el-radio-button>
+        <el-radio-button value="">{{ t('payAll') }}</el-radio-button>
+      </el-radio-group>
+      <el-input v-model="f.q" :placeholder="t('paySearch')" clearable class="grow"><template #prefix><el-icon><Search /></el-icon></template></el-input>
+      <el-select v-model="f.year" :placeholder="t('year')" clearable style="width:110px"><el-option v-for="y in years" :key="y" :value="y" :label="y" /></el-select>
+    </div>
+    <div class="panel" v-loading="loading">
+      <el-table v-if="rows.length" :data="rows" style="width:100%" :row-class-name="({ row }) => payOverdue(row, today) ? 'row-overdue' : ''">
+        <el-table-column :label="t('payContract')" min-width="190">
+          <template #default="{ row }"><a href="javascript:void 0" @click="go('detail', row.contract_id, { tab: 'payments' })">{{ contractLabel(row) }}</a>
+            <div class="muted small">{{ row.party_b }}</div></template></el-table-column>
+        <el-table-column :label="t('paySeq')" width="56" prop="seq" />
+        <el-table-column :label="t('payCondition')" min-width="200"><template #default="{ row }">{{ payLabel(row) }}<div class="muted small" v-if="row.due_rule">{{ row.due_rule }}</div></template></el-table-column>
+        <el-table-column :label="t('payPlanned')" width="140" align="right"><template #default="{ row }"><span class="num">{{ fmt(row.amount, row.currency) }}</span></template></el-table-column>
+        <el-table-column :label="t('payDue')" width="110"><template #default="{ row }"><span :class="{ danger: payOverdue(row, today) }">{{ row.due_date || '—' }}</span></template></el-table-column>
+        <el-table-column :label="t('payStatus')" width="100">
+          <template #default="{ row }">
+            <el-tag v-if="row.status === 'paid'" type="success" size="small">{{ t('ps_paid') }}</el-tag>
+            <el-tag v-else-if="payOverdue(row, today)" type="danger" size="small">{{ t('payOverdue') }}</el-tag>
+            <el-tag v-else type="info" size="small">{{ t('ps_pending') }}</el-tag></template></el-table-column>
+        <el-table-column :label="t('payPaid')" width="150"><template #default="{ row }"><template v-if="row.status === 'paid'"><div class="num">{{ fmt(row.paid_amount, row.currency) }}</div><div class="muted small">{{ row.paid_date }}</div></template></template></el-table-column>
+        <el-table-column :label="t('payProof')" width="70" align="center"><template #default="{ row }"><span v-if="row.files"><el-icon><Paperclip /></el-icon>{{ row.files }}</span></template></el-table-column>
+        <el-table-column v-if="can('payment.record')" width="80" align="right">
+          <template #default="{ row }"><el-button size="small" :type="row.status === 'paid' ? '' : 'primary'" plain @click="open(row)">{{ t('payRecord') }}</el-button></template></el-table-column>
+      </el-table>
+      <el-empty v-else-if="!loading" :description="t('payNoneFound')" />
+    </div>
+    <div class="pager" v-if="total > 0">
+      <el-pagination background :current-page="page" :page-size="pageSize" :total="total" layout="total, prev, pager, next" @current-change="onPage" />
+    </div>
+    <PaymentDialog v-model="dlg" :payment="current" :contract-id="current && current.contract_id" :currency="current && current.currency" @saved="load" />
+  </div>`,
+};
+
 // ---------- detail view ----------
 const DetailView = {
-  mixins: [mixin], components: { PageRef, DataTable, AuditDetail },
+  mixins: [mixin], components: { PageRef, DataTable, AuditDetail, PaymentPanel, FieldInput },
   props: ['id'],
   setup(props) {
     const query = store.route.query || {};
@@ -670,44 +969,44 @@ const DetailView = {
         { key: 'name', label: t('item'), min: 170, type: 'long', editOnly: true },
         { key: 'name_zh', label: t('itemZh'), min: 120, editOnly: true },
         { key: 'description', label: t('desc'), min: 240, type: 'long' },
-        { key: 'quantity', label: t('qty'), width: 80, type: 'num', optional: true },
+        { key: 'quantity', label: t('qty'), width: 100, type: 'num', input: 'pos', optional: true },
         { key: 'unit', label: t('unit'), width: 70, optional: true },
-        { key: 'unit_price', label: t('unitPrice'), width: 110, type: 'num', optional: true },
-        { key: 'amount', label: t('amount'), width: 120, type: 'num' },
-        { key: 'page', label: t('page'), width: 66, type: 'page' },
+        { key: 'unit_price', label: t('unitPrice'), width: 130, type: 'num', input: 'pos', optional: true },
+        { key: 'amount', label: t('amount'), width: 140, type: 'num', input: 'num' },
+        { key: 'page', label: t('page'), width: 96, type: 'page' },
       ],
       pay: [
-        { key: 'seq', label: t('seq'), width: 60 },
+        { key: 'seq', label: t('seq'), width: 90, input: 'int' },
         { key: store.lang === 'zh' ? 'trigger_zh' : 'trigger', label: t('trigger'), min: 180, type: 'long' },
-        { key: 'percentage', label: t('percent'), width: 80, type: 'num' },
-        { key: 'amount', label: t('amount'), width: 120, type: 'num' },
+        { key: 'percentage', label: t('percent'), width: 110, type: 'num', input: 'pct' },
+        { key: 'amount', label: t('amount'), width: 140, type: 'num', input: 'pos' },
         { key: 'due_rule', label: t('due'), min: 160, type: 'long' },
         { key: 'conditions', label: t('conditions'), min: 120, type: 'long', optional: true },
-        { key: 'page', label: t('page'), width: 66, type: 'page' },
+        { key: 'page', label: t('page'), width: 96, type: 'page' },
       ],
       ms: [
         { key: store.lang === 'zh' ? 'name_zh' : 'name', label: t('mName'), min: 160, type: 'long' },
         { key: 'deadline_rule', label: t('deadlineRule'), min: 220, type: 'long' },
-        { key: 'deadline_date', label: t('deadlineDate'), width: 110, optional: true },
+        { key: 'deadline_date', label: t('deadlineDate'), width: 150, input: 'date', optional: true },
         { key: 'deliverables', label: t('deliverables'), min: 140, type: 'long' },
-        { key: 'page', label: t('page'), width: 66, type: 'page' },
+        { key: 'page', label: t('page'), width: 96, type: 'page' },
       ],
       pen: [
         { key: store.lang === 'zh' ? 'type_zh' : 'type', label: t('pType'), min: 120 },
         { key: 'rule', label: t('pRule'), min: 240, type: 'long' },
         { key: 'cap', label: t('pCap'), min: 120, type: 'long' },
-        { key: 'page', label: t('page'), width: 66, type: 'page' },
+        { key: 'page', label: t('page'), width: 96, type: 'page' },
       ],
       clauses: [
         { key: store.lang === 'zh' ? 'topic_zh' : 'topic', label: t('topic'), width: 130 },
         { key: 'section', label: t('section'), width: 70, optional: true },
         { key: store.lang === 'zh' ? 'summary_zh' : 'summary_en', label: t('clauseSummary'), min: 280, type: 'long' },
-        { key: 'page', label: t('page'), width: 66, type: 'page' },
+        { key: 'page', label: t('page'), width: 96, type: 'page' },
       ],
       ts: [
         { key: store.lang === 'zh' ? 'label_zh' : 'label', label: t('label'), width: 170 },
         { key: 'value', label: t('value'), min: 260, type: 'long' },
-        { key: 'page', label: t('page'), width: 66, type: 'page' },
+        { key: 'page', label: t('page'), width: 96, type: 'page' },
       ],
     }));
     const basicFields = computed(() => [
@@ -716,6 +1015,8 @@ const DetailView = {
       ['start_date', 'startDate'], ['end_date', 'endDate'], ['term_text', 'termText'],
       ['governing_law', 'governingLaw'], ['dispute_resolution', 'dispute'], ['party_a_address', 'addrA'], ['party_b_address', 'addrB'],
     ]);
+    const FIELD_KIND = { signing_date: 'date', effective_date: 'date', start_date: 'date', end_date: 'date',
+      currency: 'currency', settlement_currency: 'currency', total_amount: 'pos' };
     const amountFields = [['currency', 'currency'], ['settlement_currency', 'settlement'], ['total_amount', 'totalAmount'],
       ['total_amount_text', 'totalText'], ['tax_note', 'taxNote'], ['exchange_rate_rule', 'fxRule']];
 
@@ -736,7 +1037,7 @@ const DetailView = {
 
     return { c, d, draft, editing, tab, showPdf, pdfPage, pdfKey, pdfRef, pages, srcMode, find, saving, isPdf, cur, title, subTitle, recon,
       startEdit, cancelEdit, save, setMeta, confirmReview, unconfirm, onMore, addRow, removeRow, cols, basicFields, amountFields,
-      hl, shownPages, openPage, go, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows, deptDlg, deptSel, allDepts, openDept, saveDept, askAI };
+      hl, shownPages, openPage, go, FIELD_KIND, TYPES, LIFECYCLES, WORKING, store, hitItem, historyRows, deptDlg, deptSel, allDepts, openDept, saveDept, askAI };
   },
   template: `
   <div v-if="c">
@@ -829,7 +1130,7 @@ const DetailView = {
                   </div>
                   <div class="f" v-for="[k, l] in basicFields" :key="k" v-show="editing || (d.basic && d.basic[k])">
                     <div class="k">{{ t(l) }}<template v-if="k === 'title_zh'"> (中文)</template></div>
-                    <el-input v-if="editing" v-model="draft.basic[k]" />
+                    <FieldInput v-if="editing" v-model="draft.basic[k]" :kind="FIELD_KIND[k]" />
                     <div v-else class="v">{{ d.basic && d.basic[k] }}</div>
                   </div>
                 </div>
@@ -859,7 +1160,7 @@ const DetailView = {
                 <div class="grid">
                   <div class="f" v-for="[k, l] in amountFields" :key="k" v-show="editing || (d.amount && d.amount[k] != null && d.amount[k] !== '')">
                     <div class="k">{{ t(l) }}</div>
-                    <el-input v-if="editing" v-model="draft.amount[k]" />
+                    <FieldInput v-if="editing" v-model="draft.amount[k]" :kind="FIELD_KIND[k]" />
                     <div v-else class="v" :class="{ 'big-num': k === 'total_amount' }">{{ k === 'total_amount' ? fmt(d.amount[k]) : d.amount[k] }}</div>
                   </div>
                 </div>
@@ -874,7 +1175,8 @@ const DetailView = {
 
           <el-tab-pane :label="t('tabPayments')" name="payments">
             <template v-if="d">
-              <div class="card"><h2>{{ t('payments') }} <span class="muted" v-if="cur">{{ cur }}</span></h2>
+              <PaymentPanel v-if="!editing" :contract-id="c.id" :currency="cur" :working="WORKING.includes(c.status)" />
+              <div class="card"><h2>{{ t('payments') }} <span class="muted" v-if="cur">{{ cur }}</span> <span class="muted small">· {{ t('payAiTermsNote') }}</span></h2>
                 <DataTable :rows="d.payment_terms" :cols="cols.pay" :editing="editing"
                   @add="addRow('payment_terms', { seq: (draft.payment_terms.length + 1) })" @remove="i => removeRow('payment_terms', i)" /></div>
               <div class="card"><h2>{{ t('milestones') }}</h2>
@@ -1558,7 +1860,7 @@ const SettingsView = {
 // ---------- root ----------
 const Root = {
   mixins: [mixin],
-  components: { AuthView, ListView, DetailView, AuditView, UsersView, SettingsView, AIView },
+  components: { AuthView, ListView, DetailView, AuditView, UsersView, SettingsView, AIView, PaymentsView },
   setup() {
     const epLocale = computed(() => store.lang === 'zh' ? ElementPlusLocaleZhCn : ElementPlusLocaleEn);
     function sync() { store.route = parseHash(); window.scrollTo(0, 0); }
@@ -1622,6 +1924,7 @@ const Root = {
             <div><div class="brand-name">{{ t('appName') }}</div><div class="brand-sub">SIPG Bayport</div></div></div>
           <el-menu :default-active="active" @select="k => go(k)" background-color="transparent" text-color="#C9D3DD" active-text-color="#ffffff" class="nav-menu">
             <el-menu-item index="list"><el-icon><Tickets /></el-icon><span>{{ t('navContracts') }}</span></el-menu-item>
+            <el-menu-item index="payments"><el-icon><Wallet /></el-icon><span>{{ t('navPayments') }}</span></el-menu-item>
             <el-menu-item v-if="can('ai.use')" index="ai"><el-icon><ChatDotRound /></el-icon><span>{{ t('navAI') }}</span></el-menu-item>
             <el-menu-item v-if="can('audit.view')" index="audit"><el-icon><Notebook /></el-icon><span>{{ t('navAudit') }}</span></el-menu-item>
             <el-menu-item v-if="can('admin')" index="users"><el-icon><User /></el-icon><span>{{ t('navUsers') }}</span>
@@ -1653,6 +1956,7 @@ const Root = {
             <ListView v-if="store.route.name === 'list'" :key="'l' + (store.route.query.q || '')" />
             <DetailView v-else-if="store.route.name === 'detail'" :id="store.route.id" :key="'d' + store.route.id + JSON.stringify(store.route.query)" />
             <AuditView v-else-if="store.route.name === 'audit'" />
+            <PaymentsView v-else-if="store.route.name === 'payments'" />
             <AIView v-else-if="store.route.name === 'ai'" :id="store.route.id" />
             <UsersView v-else-if="store.route.name === 'users'" />
             <SettingsView v-else-if="store.route.name === 'settings'" />

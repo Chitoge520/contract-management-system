@@ -3,7 +3,7 @@ import queue
 import threading
 import traceback
 
-from . import db
+from . import db, payments
 from .extract_text import read_any
 from .llm import extract_contract
 from .redact import redact_text
@@ -46,6 +46,7 @@ def _process(cid, stage):
         if not _exists(cid):
             return
         db.save_data(cid, data, model)
+        payments.sync_from_extraction(cid, data)  # payment nodes from the extracted payment terms
         db.set_status(cid, "review", None)
     from . import auth
     auth.log(None, "extracted", cid, {"model": model, "items": len(data.get("line_items") or [])})

@@ -22,13 +22,15 @@ PERMISSIONS = [
     "contract.delete",       # delete contracts
     "contract.download",     # download the original file
     "contract.export",       # export to Excel
+    "payment.record",        # record payment of a payment node, add / remove proof files
     "ai.use",                # use the AI assistant
     "audit.view",            # view the audit log
 ]
 BUILTIN_ROLES = {
     "admin": ("管理员", PERMISSIONS),
     "editor": ("编辑", ["contract.upload", "contract.edit", "contract.review", "contract.reprocess",
-                        "contract.assign_dept", "contract.download", "contract.export", "ai.use", "audit.view"]),
+                        "contract.assign_dept", "contract.download", "contract.export", "payment.record", "ai.use",
+                        "audit.view"]),
     "viewer": ("只读", ["contract.download", "contract.export", "ai.use", "audit.view"]),
 }
 

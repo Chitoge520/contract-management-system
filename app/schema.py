@@ -250,7 +250,65 @@ def step_search_text(c):
         c.execute("UPDATE contracts SET search_text=? WHERE id=?", (db.search_text_for(dict(r)), r["id"]))
 
 
-MIGRATIONS = [step_baseline, step_foreign_keys, step_search_text]
+# ---------------------------------------------------------------- step 4
+# Payment nodes with the record of whether they were paid, and proof files (see payments.py).
+# Nodes are created for contracts that were already analysed; the editor role may record payments.
+PAYMENT_TABLES = """
+CREATE TABLE payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_id INTEGER NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
+    seq INTEGER,
+    trigger_en TEXT,            -- payment condition, contract language
+    trigger_zh TEXT,
+    percentage REAL,
+    amount REAL,                -- planned amount
+    currency TEXT,
+    due_rule TEXT,              -- e.g. "within 30 days after acceptance"
+    due_date TEXT,              -- planned date set by a user (YYYY-MM-DD)
+    page INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid')),
+    paid_amount REAL,
+    paid_date TEXT,
+    note TEXT,
+    recorded_by TEXT,
+    recorded_at TEXT,
+    source TEXT NOT NULL DEFAULT 'ai' CHECK (source IN ('ai', 'manual')),
+    created_at TEXT
+);
+CREATE INDEX idx_payments_contract ON payments(contract_id, seq);
+CREATE INDEX idx_payments_status ON payments(status, due_date);
+CREATE TABLE payment_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+    file_name TEXT NOT NULL,
+    stored_name TEXT NOT NULL,
+    size INTEGER,
+    uploaded_by TEXT,
+    uploaded_at TEXT
+);
+CREATE INDEX idx_payment_files_payment ON payment_files(payment_id);
+"""
+
+
+def step_payments(c):
+    from . import payments
+    for sql in PAYMENT_TABLES.split(";"):
+        if sql.strip():
+            c.execute(sql)
+    for r in c.execute("SELECT id, data_json FROM contracts WHERE data_json IS NOT NULL").fetchall():
+        try:
+            data = json.loads(r["data_json"])
+        except ValueError:
+            continue
+        payments.sync_from_extraction(r["id"], data, conn=c)
+    row = c.execute("SELECT permissions FROM roles WHERE key='editor'").fetchone()
+    if row:
+        perms = json.loads(row["permissions"] or "[]")
+        if "payment.record" not in perms:
+            c.execute("UPDATE roles SET permissions=? WHERE key='editor'", (json.dumps(perms + ["payment.record"]),))
+
+
+MIGRATIONS = [step_baseline, step_foreign_keys, step_search_text, step_payments]
 LATEST = len(MIGRATIONS)
 
 

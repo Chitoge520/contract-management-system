@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
-from . import access, agent, auth, captcha, db, llm, pipeline
+from . import access, agent, auth, captcha, db, llm, payments, pipeline
 from .auth import current_user, require
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -594,11 +594,13 @@ def list_contracts(q: str = "", type: str = "", party: str = "", status: str = "
         args = args + [page_size, (page - 1) * page_size]
     found = db.q(sql, args)
     depts = access.departments_map([r["id"] for r in found])
+    pays = payments.summaries([r["id"] for r in found])
     words = q.split()
     out = []
     for r in found:
         row = _list_row(r)
         row["departments"] = depts.get(r["id"], [])
+        row["payments"] = pays.get(r["id"])
         if words:
             row["hits"] = _hits(r["id"], json.loads(r["data_json"]) if r.get("data_json") else {}, words)
         out.append(row)
@@ -652,6 +654,7 @@ def update_contract(cid: int, body: dict = Body(...), user=Depends(require("cont
         changes = auth.diff(old, body["data"])
         if changes:
             db.save_data(cid, body["data"])
+            payments.sync_from_extraction(cid, body["data"])  # recorded payment nodes are kept
             db.ex("UPDATE contracts SET updated_by=? WHERE id=?", (_name(user), cid))
             reopened = row["status"] == "confirmed"
             if reopened:  # a confirmed contract that is edited must be reviewed again
@@ -700,6 +703,7 @@ def delete(cid: int, user=Depends(require("contract.delete"))):
     row = _get(cid, user)
     _require_idle(row)
     auth.log(user, "delete", cid, {"file": row["file_name"]})
+    payments.delete_contract_files(cid)
     db.delete_contract(cid)
     try:
         (db.FILES_DIR / row["stored_name"]).unlink(missing_ok=True)
@@ -737,6 +741,123 @@ def stats(user=Depends(current_user)):
         f"SELECT coalesce(signing_date, effective_date, start_date, uploaded_at) y FROM contracts WHERE {cond}", a)} - {""},
         reverse=True)
     return {"by_status": by_status, "parties": parties, "years": years, "count": sum(by_status.values())}
+
+
+# ================= payments =================
+pay_user = require("payment.record")
+
+
+def _payment(pid, user):
+    """The payment node, if the user may see its contract."""
+    p = payments.get(pid)
+    if not access.can_view(user, p["contract_id"]):
+        raise HTTPException(404, "Payment not found")
+    return p
+
+
+def _pay_label(p):
+    return f"#{p['seq']} " + (p.get("trigger_zh") or p.get("trigger_en") or "")
+
+
+@app.get("/api/contracts/{cid}/payments")
+def contract_payments(cid: int, user=Depends(current_user)):
+    _get(cid, user)
+    return {"rows": payments.for_contract(cid), "today": payments.today()}
+
+
+@app.post("/api/contracts/{cid}/payments")
+def add_payment(cid: int, body: dict = Body(...), user=Depends(pay_user)):
+    _get(cid, user)
+    p = payments.create(cid, body, _name(user))
+    auth.log(user, "payment_add", cid, {"payment": _pay_label(p), "amount": p["amount"], "status": p["status"]})
+    return p
+
+
+@app.put("/api/payments/{pid}")
+def update_payment(pid: int, body: dict = Body(...), user=Depends(pay_user)):
+    _payment(pid, user)
+    p, changes = payments.update(pid, body, _name(user))
+    if changes:
+        auth.log(user, "payment_update", p["contract_id"], {"payment": _pay_label(p), "changes": changes})
+    return p
+
+
+@app.delete("/api/payments/{pid}")
+def delete_payment(pid: int, user=Depends(pay_user)):
+    p = _payment(pid, user)
+    payments.delete(pid)
+    auth.log(user, "payment_delete", p["contract_id"], {"payment": _pay_label(p), "status": p["status"]})
+    return {"ok": True}
+
+
+@app.post("/api/payments/{pid}/files")
+async def upload_payment_files(pid: int, files: List[UploadFile] = File(...), user=Depends(pay_user)):
+    p = _payment(pid, user)
+    out = []
+    for f in files:
+        content = await f.read()
+        rec = payments.add_file(pid, f.filename, content, _name(user))
+        auth.log(user, "payment_file_add", p["contract_id"], {"payment": _pay_label(p), "file": rec["file_name"]})
+        out.append(rec)
+    return out
+
+
+@app.get("/api/payment-files/{fid}")
+def get_payment_file(fid: int, download: int = 0, user=Depends(current_user)):
+    f = payments.get_file(fid)
+    if not access.can_view(user, f["contract_id"]):
+        raise HTTPException(404, "File not found")
+    path = payments.proof_dir() / f["stored_name"]
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    media = payments.media_type(f["stored_name"])
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if download or media not in payments.INLINE_TYPES:
+        return FileResponse(path, media_type=media or "application/octet-stream", filename=f["file_name"], headers=headers)
+    headers["Content-Disposition"] = "inline; filename*=UTF-8''proof" + path.suffix
+    return FileResponse(path, media_type=media, headers=headers)
+
+
+@app.delete("/api/payment-files/{fid}")
+def delete_payment_file(fid: int, user=Depends(pay_user)):
+    f = payments.get_file(fid)
+    if not access.can_view(user, f["contract_id"]):
+        raise HTTPException(404, "File not found")
+    p = payments.get(f["payment_id"])
+    payments.delete_file(fid)
+    auth.log(user, "payment_file_delete", f["contract_id"], {"payment": _pay_label(p), "file": f["file_name"]})
+    return {"ok": True}
+
+
+@app.get("/api/payments")
+def payment_tracking(status: str = "", q: str = "", year: str = "", page: int = 1, page_size: int = 20,
+                     user=Depends(current_user)):
+    """Payment nodes of every contract the user may see. status: pending / paid / overdue / due30 (due in 30 days)."""
+    where, args = _contract_filter(user, year=year)
+    sql = f"FROM payments p JOIN contracts ON contracts.id=p.contract_id WHERE {where}"
+    today = payments.today()
+    if status == "paid":
+        sql += " AND p.status='paid'"
+    elif status == "pending":
+        sql += " AND p.status<>'paid'"
+    elif status == "overdue":
+        sql += " AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date<?"
+        args.append(today)
+    elif status == "due30":
+        sql += " AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date>=? AND p.due_date<=date(?, '+30 days')"
+        args += [today, today]
+    for word in q.split():
+        like = f"%{word.lower()}%"
+        sql += (" AND (coalesce(contracts.search_text,'') LIKE ? OR lower(coalesce(p.trigger_en,'')||' '||"
+                "coalesce(p.trigger_zh,'')||' '||coalesce(p.note,'')) LIKE ?)")
+        args += [like, like]
+    total = db.q("SELECT count(*) n " + sql, args, one=True)["n"]
+    page_size, page = min(max(page_size, 1), 200), max(page, 1)
+    rows = db.q("SELECT p.*, contracts.contract_no, contracts.title, contracts.title_zh, contracts.party_b, "
+                "(SELECT count(*) FROM payment_files f WHERE f.payment_id=p.id) files " + sql +
+                " ORDER BY (p.status='paid'), p.due_date IS NULL, p.due_date, contracts.id DESC, p.seq LIMIT ? OFFSET ?",
+                args + [page_size, (page - 1) * page_size])
+    return {"total": total, "page": page, "page_size": page_size, "rows": rows, "today": today}
 
 
 # ================= export / backup =================
@@ -812,12 +933,12 @@ def export_xlsx(ids: str = "", q: str = "", type: str = "", party: str = "", sta
     ws3 = wb.create_sheet("付款 Payments")
     data = []
     for r in rows:
-        d = json.loads(r["data_json"]) if r.get("data_json") else {}
-        for p in d.get("payment_terms") or []:
-            data.append([r["id"], r["contract_no"], r["party_b"], p.get("seq"), p.get("trigger"), p.get("trigger_zh"),
-                         p.get("percentage"), db.to_float(p.get("amount")), r["currency"], p.get("due_rule"), p.get("page")])
-    sheet(ws3, ["合同ID", "合同号 No.", "乙方 Party B", "期次", "付款条件 Trigger", "中文", "比例 %", "金额 Amount", "币种",
-                "付款期限 Due", "页码"], data, [8, 18, 28, 6, 40, 30, 8, 14, 8, 40, 6])
+        for p in payments.export_rows(r["id"]):
+            data.append([r["id"], r["contract_no"], r["party_b"]] + p)
+    sheet(ws3, ["合同ID", "合同号 No.", "乙方 Party B", "期次", "付款条件 Trigger", "中文", "比例 %", "计划金额 Planned",
+                "币种", "付款期限 Due rule", "计划日期 Due date", "状态 Status", "实付金额 Paid", "付款日期 Paid on",
+                "备注 Note", "登记人 Recorded by", "凭证数 Proofs", "页码"], data,
+          [8, 18, 28, 6, 40, 30, 8, 14, 8, 36, 12, 14, 14, 12, 30, 12, 8, 6])
 
     for w in (ws, ws2, ws3):
         for row in w.iter_rows(min_row=2):
@@ -847,8 +968,9 @@ def backup(user=Depends(admin)):
         z.write(snap, "data/contracts.db")
         if llm.CONFIG_PATH.exists():  # settings, so a restore works without setting everything up again
             z.write(llm.CONFIG_PATH, "data/config.json")
-        for f in db.FILES_DIR.iterdir():
-            z.write(f, f"data/files/{f.name}")
+        for f in db.FILES_DIR.rglob("*"):  # originals and payment proof files
+            if f.is_file():
+                z.write(f, "data/files/" + f.relative_to(db.FILES_DIR).as_posix())
     # remove the temporary copy once the download has been sent
     return FileResponse(zpath, filename=zpath.name, media_type="application/zip",
                         background=BackgroundTask(shutil.rmtree, tmp, ignore_errors=True))
