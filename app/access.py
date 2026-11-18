@@ -37,8 +37,6 @@ def init():
         for col in ("ai_daily_questions", "ai_daily_tokens"):  # per-user AI quota overrides (NULL = default)
             if col not in cols:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER")
-        # links left behind by contracts deleted before delete_contract cleaned them up
-        c.execute("DELETE FROM contract_departments WHERE contract_id NOT IN (SELECT id FROM contracts)")
         c.commit()
 
 
