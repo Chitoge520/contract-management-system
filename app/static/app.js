@@ -690,7 +690,7 @@ const PaymentDialog = {
     return { f, saving, files, pid, uploader, setPaid, save, onUploaded, onUploadError, removeFile, removeNode, fileSize, emit };
   },
   template: `
-  <el-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)" :title="pid ? t('payEditTitle') : t('payNewTitle')" width="640px" @closed="saving = false">
+  <el-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)" :title="pid ? t('payEditTitle') : t('payNewTitle')" width="640px" append-to-body @closed="saving = false">
     <el-form label-width="130px" label-position="left" class="pay-form" @submit.prevent>
       <div class="pay-status-row">
         <el-radio-group :model-value="f.status" @update:model-value="setPaid" size="large">
@@ -744,8 +744,10 @@ const PaymentDialog = {
 
 // payment execution on the contract page
 const PaymentPanel = {
-  mixins: [mixin], components: { PageRef, PaymentDialog }, props: ['contractId', 'currency', 'working'],
-  setup(props) {
+  mixins: [mixin], components: { PageRef, PaymentDialog },
+  props: { contractId: [Number, String], currency: String, working: Boolean, embedded: Boolean },
+  emits: ['changed'],
+  setup(props, { emit }) {
     const rows = ref([]); const today = ref(todayStr()); const loading = ref(true);
     const dlg = ref(false); const current = ref(null);
     async function load() {
@@ -754,20 +756,24 @@ const PaymentPanel = {
       loading.value = false;
     }
     onMounted(load);
+    async function saved() { await load(); emit('changed'); }
+    const compact = computed(() => props.embedded && store.vw < 1500);  // inside the tracking page: fewer, narrower columns
+    // phones, and the tracking page below 1200 px: status, dates and amounts stacked under the condition
+    const stacked = computed(() => store.vw < 640 || (props.embedded && store.vw < 1200));
     watch(() => props.working, (now, before) => { if (before && !now) load(); });  // AI finished: nodes may have changed
     const paid = computed(() => rows.value.filter(r => payState(r, today.value) === 'paid'));
     const overdue = computed(() => rows.value.filter(r => payState(r, today.value) === 'overdue').length);
     const incomplete = computed(() => rows.value.filter(r => payState(r, today.value) === 'incomplete').length);
     function open(p) { current.value = p; dlg.value = true; }
-    return { rows, today, loading, dlg, current, paid, overdue, incomplete, open, load, payOverdue, payState, PAY_TAG, payLabel, sumsByCurrency };
+    return { rows, today, loading, dlg, current, paid, overdue, incomplete, open, load, saved, compact, stacked, payOverdue, payState, PAY_TAG, payLabel, sumsByCurrency };
   },
   template: `
-  <div class="card" v-loading="loading">
+  <div :class="embedded ? 'pay-embedded' : 'card'" v-loading="loading">
     <div class="card-head">
-      <div><h2>{{ t('payExec') }}</h2><div class="muted small">{{ t('payExecSub') }}</div></div>
+      <div v-if="!embedded"><h2>{{ t('payExec') }}</h2><div class="muted small">{{ t('payExecSub') }}</div></div><div v-else></div>
       <el-button v-if="can('payment.record')" size="small" @click="open(null)"><el-icon><Plus /></el-icon>{{ t('payAdd') }}</el-button>
     </div>
-    <div v-if="rows.length" class="pay-sum">
+    <div v-if="rows.length && !embedded" class="pay-sum">
       <div><div class="k">{{ t('payProgress') }}</div><div class="v">{{ paid.length }} / {{ rows.length }}</div></div>
       <div><div class="k">{{ t('payPlannedTotal') }}</div><div class="v num">{{ sumsByCurrency(rows, 'amount') }}</div></div>
       <div><div class="k">{{ t('payPaidTotal') }}</div><div class="v num">{{ sumsByCurrency(paid, 'paid_amount') }}</div></div>
@@ -775,14 +781,26 @@ const PaymentPanel = {
       <div v-if="incomplete"><div class="k">{{ t('ps_incomplete') }}</div><div class="v warn">{{ incomplete }}</div></div>
     </div>
     <el-table v-if="rows.length" :data="rows" size="small" style="width:100%" :row-class-name="({ row }) => payOverdue(row, today) ? 'row-overdue' : ''">
-      <el-table-column :label="t('paySeq')" width="56" prop="seq" />
-      <el-table-column :label="t('payCondition')" min-width="220">
+      <el-table-column :label="t('paySeq')" :width="vw < 640 ? 40 : 56" prop="seq" />
+      <el-table-column :label="t('payCondition')" :min-width="stacked ? 140 : 200">
         <template #default="{ row }">
           <div>{{ payLabel(row) }} <PageRef :p="row.page" /></div>
           <div class="muted small" v-if="row.due_rule">{{ row.due_rule }}</div>
+          <div class="muted small" v-if="row.percentage != null && compact">{{ t('payPct') }} {{ row.percentage }}%</div>
           <div class="muted small" v-if="row.note">{{ t('payNote') }}：{{ row.note }}</div>
+          <div v-if="stacked" class="pay-phone">
+            <div><el-tag :type="PAY_TAG[payState(row, today)]" size="small">{{ t('ps_' + payState(row, today)) }}</el-tag>
+              <span v-if="row.due_date" class="ml-xs" :class="{ danger: payOverdue(row, today) }">{{ row.due_date }}</span></div>
+            <div v-if="row.amount != null"><span class="muted small">{{ t('payPlanned') }}</span>
+              <span class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.amount) }}</span></span></div>
+            <div v-if="row.status === 'paid'"><span class="muted small">{{ t('payPaid') }}</span>
+              <span class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ row.paid_amount != null ? fmt(row.paid_amount) : '—' }}</span></span>
+              <span class="muted small"> {{ row.paid_date }}</span></div>
+            <div v-for="fl in row.files" :key="fl.id" class="proof-link"><a :href="'/api/payment-files/' + fl.id" target="_blank" rel="noopener"><el-icon><Paperclip /></el-icon>{{ fl.file_name }}</a></div>
+          </div>
         </template></el-table-column>
-      <el-table-column :label="t('payPct')" width="70" align="right"><template #default="{ row }">{{ row.percentage != null ? row.percentage + '%' : '' }}</template></el-table-column>
+      <template v-if="!stacked">
+      <el-table-column v-if="!compact" :label="t('payPct')" width="70" align="right"><template #default="{ row }">{{ row.percentage != null ? row.percentage + '%' : '' }}</template></el-table-column>
       <el-table-column :label="t('payPlanned')" width="150" align="right"><template #default="{ row }"><span v-if="row.amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.amount) }}</span></span></template></el-table-column>
       <el-table-column :label="t('payDue')" width="110"><template #default="{ row }"><span :class="{ danger: payOverdue(row, today) }">{{ row.due_date || '—' }}</span></template></el-table-column>
       <el-table-column :label="t('payStatus')" width="100">
@@ -792,80 +810,123 @@ const PaymentPanel = {
       <el-table-column :label="t('payPaid')" width="150">
         <template #default="{ row }"><template v-if="row.status === 'paid'">
           <div><span v-if="row.paid_amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.paid_amount) }}</span></span><span v-if="row.paid_amount == null">—</span></div><div class="muted small">{{ row.paid_date || '—' }}</div></template></template></el-table-column>
-      <el-table-column :label="t('payProofShort')" width="150">
+      <el-table-column :label="t('payProofShort')" :width="compact ? 64 : 150" :align="compact ? 'center' : 'left'">
         <template #default="{ row }">
-          <div v-for="fl in row.files" :key="fl.id" class="proof-link"><a :href="'/api/payment-files/' + fl.id" target="_blank" rel="noopener" :title="fl.file_name"><el-icon><Paperclip /></el-icon>{{ fl.file_name }}</a></div>
+          <template v-if="!compact"><div v-for="fl in row.files" :key="fl.id" class="proof-link"><a :href="'/api/payment-files/' + fl.id" target="_blank" rel="noopener" :title="fl.file_name"><el-icon><Paperclip /></el-icon>{{ fl.file_name }}</a></div></template>
+          <el-popover v-else-if="row.files.length" trigger="click" placement="left" :width="260">
+            <template #reference><el-button link size="small" @click.stop><el-icon><Paperclip /></el-icon>{{ row.files.length }}</el-button></template>
+            <div v-for="fl in row.files" :key="fl.id" class="proof-link wide"><a :href="'/api/payment-files/' + fl.id" target="_blank" rel="noopener">{{ fl.file_name }}</a></div>
+          </el-popover>
         </template></el-table-column>
-      <el-table-column v-if="can('payment.record')" width="76" align="center" :fixed="vw >= 640 ? 'right' : false">
+      </template>
+      <el-table-column v-if="can('payment.record')" width="76" align="center" fixed="right">
         <template #default="{ row }"><el-button size="small" :type="row.status === 'paid' ? '' : 'primary'" plain @click="open(row)">{{ t('payRecord') }}</el-button></template></el-table-column>
     </el-table>
     <div v-else-if="!loading" class="muted small pay-empty">{{ working ? t('payWaitAI') : t('payNone') }}</div>
-    <PaymentDialog v-model="dlg" :payment="current" :contract-id="contractId" :currency="currency" @saved="load" />
+    <PaymentDialog v-model="dlg" :payment="current" :contract-id="contractId" :currency="currency" @saved="saved" />
   </div>`,
 };
 
-// all payment nodes the user may see
+// payment tracking, one row per contract; expand a row to see and record its payment nodes
 const PaymentsView = {
-  mixins: [mixin], components: { PaymentDialog },
+  mixins: [mixin], components: { PaymentPanel },
   setup() {
     const f = reactive({ status: store.route.query.status || 'pending', q: '', year: '' });
     const rows = ref([]); const total = ref(0); const page = ref(1); const pageSize = ref(20); const today = ref(todayStr());
-    const loading = ref(true); const years = ref([]); const dlg = ref(false); const current = ref(null);
+    const loading = ref(true); const years = ref([]); const expanded = ref([]); const table = ref(null);
     let debounce = null, seq = 0;
-    async function load() {
+    async function load(keepOrder) {
       const my = ++seq;
-      const p = new URLSearchParams({ page: page.value, page_size: pageSize.value });
-      for (const k in f) if (f[k]) p.set(k, f[k]);
+      const p = new URLSearchParams({ page: page.value, page_size: pageSize.value, status: f.status });
+      if (f.q) p.set('q', f.q);
+      if (f.year) p.set('year', f.year);
       try {
-        const r = await api('/api/payments?' + p.toString());
+        const r = await api('/api/payments/contracts?' + p.toString());
         if (my !== seq) return;
-        rows.value = r.rows; total.value = r.total; today.value = r.today;
+        let list = r.rows;
+        if (keepOrder === true) {  // after recording a payment: update the figures, don't make the open contract jump
+          const pos = new Map(rows.value.map((x, i) => [x.contract_id, i]));
+          list = [...list].sort((a, b) => (pos.has(a.contract_id) ? pos.get(a.contract_id) : 1e9) - (pos.has(b.contract_id) ? pos.get(b.contract_id) : 1e9));
+        }
+        rows.value = list; total.value = r.total; today.value = r.today;
       } catch (e) { ElMessage.error(e.message); }
       loading.value = false;
     }
+    function refresh() { load(true); }
     api('/api/stats').then(s => { years.value = s.years; }).catch(() => {});
-    function firstPage() { page.value = 1; load(); }
+    function firstPage() { page.value = 1; expanded.value = []; load(); }
     watch(() => [f.status, f.year], firstPage);
     watch(() => f.q, () => { clearTimeout(debounce); debounce = setTimeout(firstPage, 300); });
     onMounted(load);
-    function contractLabel(r) { return r.contract_no || (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || ('#' + r.contract_id); }
-    async function open(r) {
-      try { const d = await api('/api/contracts/' + r.contract_id + '/payments'); current.value = d.rows.find(x => x.id === r.id) || r; dlg.value = true; }
-      catch (e) { ElMessage.error(e.message); }
-    }
-    function onPage(n) { page.value = n; load(); window.scrollTo(0, 0); }
-    return { f, rows, total, page, pageSize, today, loading, years, dlg, current, load, firstPage, contractLabel, open, onPage, go, payOverdue, payState, PAY_TAG, payLabel };
+    function contractTitle(r) { return (store.lang === 'zh' ? (r.title_zh || r.title) : (r.title || r.title_zh)) || ''; }
+    function onPage(n) { page.value = n; expanded.value = []; load(); window.scrollTo(0, 0); }
+    function toggle(row) { table.value && table.value.toggleRowExpansion(row); }
+    function onExpand(row, list) { expanded.value = list.map(r => r.contract_id); }
+    return { f, rows, total, page, pageSize, today, loading, years, expanded, table, load, refresh, contractTitle, onPage, toggle, onExpand, go };
   },
   template: `
   <div>
     <div class="ph"><div><h1>{{ t('navPayments') }}</h1><div class="sub">{{ t('paymentsSub') }}</div></div></div>
     <div class="filters">
       <el-radio-group v-model="f.status">
-        <el-radio-button value="pending">{{ t('ps_pending') }}</el-radio-button>
+        <el-radio-button value="pending">{{ t('pc_pending') }}</el-radio-button>
         <el-radio-button value="overdue">{{ t('ps_overdue') }}</el-radio-button>
         <el-radio-button value="due30">{{ t('payDue30') }}</el-radio-button>
         <el-radio-button value="incomplete">{{ t('ps_incomplete') }}</el-radio-button>
-        <el-radio-button value="paid">{{ t('ps_paid') }}</el-radio-button>
+        <el-radio-button value="paid">{{ t('pc_paid') }}</el-radio-button>
         <el-radio-button value="">{{ t('payAll') }}</el-radio-button>
       </el-radio-group>
       <el-input v-model="f.q" :placeholder="t('paySearch')" clearable class="grow"><template #prefix><el-icon><Search /></el-icon></template></el-input>
       <el-select v-model="f.year" :placeholder="t('year')" clearable style="width:110px"><el-option v-for="y in years" :key="y" :value="y" :label="y" /></el-select>
     </div>
     <div class="panel" v-loading="loading">
-      <el-table v-if="rows.length" :data="rows" style="width:100%" :row-class-name="({ row }) => payOverdue(row, today) ? 'row-overdue' : ''">
-        <el-table-column :label="t('payContract')" min-width="160">
-          <template #default="{ row }"><a href="javascript:void 0" @click="go('detail', row.contract_id, { tab: 'payments' })">{{ contractLabel(row) }}</a>
-            <div class="muted small">{{ row.party_b }}</div></template></el-table-column>
-        <el-table-column :label="t('payCondition')" min-width="180"><template #default="{ row }"><span class="muted">#{{ row.seq }}</span> {{ payLabel(row) }}<div class="muted small" v-if="row.due_rule">{{ row.due_rule }}</div></template></el-table-column>
-        <el-table-column :label="t('payPlanned')" width="150" align="right"><template #default="{ row }"><span v-if="row.amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.amount) }}</span></span></template></el-table-column>
-        <el-table-column :label="t('payDue')" width="110"><template #default="{ row }"><span :class="{ danger: payOverdue(row, today) }">{{ row.due_date || '—' }}</span></template></el-table-column>
-        <el-table-column :label="t('payStatus')" width="100">
+      <el-table v-if="rows.length" ref="table" :data="rows" row-key="contract_id" style="width:100%" class="pay-contracts"
+        :expand-row-keys="expanded" @expand-change="onExpand" @row-click="toggle" row-class-name="click">
+        <el-table-column type="expand" width="36">
           <template #default="{ row }">
-            <el-tag :type="PAY_TAG[payState(row, today)]" size="small">{{ t('ps_' + payState(row, today)) }}</el-tag></template></el-table-column>
-        <el-table-column :label="t('payPaid')" width="150"><template #default="{ row }"><template v-if="row.status === 'paid'"><div><span v-if="row.paid_amount != null" class="money"><span class="cur">{{ row.currency }}</span> <span class="amt">{{ fmt(row.paid_amount) }}</span></span><span v-if="row.paid_amount == null">—</span></div><div class="muted small">{{ row.paid_date || '—' }}</div></template></template></el-table-column>
-        <el-table-column :label="t('payProofShort')" width="60" align="center"><template #default="{ row }"><span v-if="row.files"><el-icon><Paperclip /></el-icon>{{ row.files }}</span></template></el-table-column>
-        <el-table-column v-if="can('payment.record')" width="76" align="center" :fixed="vw >= 640 ? 'right' : false">
-          <template #default="{ row }"><el-button size="small" :type="row.status === 'paid' ? '' : 'primary'" plain @click="open(row)">{{ t('payRecord') }}</el-button></template></el-table-column>
+            <PaymentPanel :contract-id="row.contract_id" :currency="row.currency" embedded @changed="refresh" />
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('payContract')" min-width="220">
+          <template #default="{ row }">
+            <a href="javascript:void 0" class="mono-ish" @click.stop="go('detail', row.contract_id, { tab: 'payments' })">{{ row.contract_no || ('#' + row.contract_id) }}</a>
+            <div class="t-title">{{ contractTitle(row) }}</div>
+            <div class="muted small">{{ row.party_b }}</div>
+            <div v-if="vw < 640" class="pay-phone">
+              <div><span class="muted small">{{ t('payProgress') }}</span> <b>{{ row.paid }} / {{ row.nodes }}</b></div>
+              <div v-for="x in row.totals" :key="x.currency"><span class="muted small">{{ t('payUnpaid') }}</span>
+                <span class="money" :class="{ danger: row.overdue && x.unpaid > 0 }"><span class="cur">{{ x.currency }}</span> <span class="amt">{{ fmt(x.unpaid) }}</span></span></div>
+              <div v-if="row.next_due"><span class="muted small">{{ t('payNextDue') }}</span> <span :class="{ danger: row.next_due < today }">{{ row.next_due }}</span></div>
+              <div class="pay-flags">
+                <el-tag v-if="row.overdue" type="danger" size="small" effect="plain">{{ t('ps_overdue') }} {{ row.overdue }}</el-tag>
+                <el-tag v-if="row.incomplete" type="warning" size="small" effect="plain">{{ t('ps_incomplete') }} {{ row.incomplete }}</el-tag>
+              </div>
+            </div>
+          </template></el-table-column>
+        <template v-if="vw >= 640">
+        <el-table-column :label="t('payProgress')" width="120">
+          <template #default="{ row }">
+            <div class="num">{{ row.paid }} / {{ row.nodes }}</div>
+            <el-progress :percentage="Math.round(100 * row.paid / Math.max(1, row.nodes))" :show-text="false" :stroke-width="5"
+              :status="row.paid === row.nodes ? 'success' : ''" />
+          </template></el-table-column>
+        <el-table-column v-if="vw >= 1200" :label="t('payPlannedTotal')" width="160" align="right">
+          <template #default="{ row }"><div v-for="x in row.totals" :key="x.currency" class="money"><span class="cur">{{ x.currency }}</span> <span class="amt">{{ fmt(x.planned) }}</span></div></template></el-table-column>
+        <el-table-column v-if="vw >= 1200" :label="t('payPaidTotal')" width="160" align="right">
+          <template #default="{ row }"><div v-for="x in row.totals" :key="x.currency" class="money"><span class="cur">{{ x.currency }}</span> <span class="amt">{{ fmt(x.paid) }}</span></div></template></el-table-column>
+        <el-table-column :label="t('payUnpaid')" width="160" align="right">
+          <template #default="{ row }"><div v-for="x in row.totals" :key="x.currency" class="money" :class="{ danger: row.overdue && x.unpaid > 0 }"><span class="cur">{{ x.currency }}</span> <span class="amt">{{ fmt(x.unpaid) }}</span></div></template></el-table-column>
+        <el-table-column :label="t('payNextDue')" width="130">
+          <template #default="{ row }">
+            <span v-if="row.next_due" :class="{ danger: row.next_due < today }">{{ row.next_due }}</span>
+            <span v-else class="muted">—</span>
+            <div class="pay-flags">
+              <el-tag v-if="row.overdue" type="danger" size="small" effect="plain">{{ t('ps_overdue') }} {{ row.overdue }}</el-tag>
+              <el-tag v-if="row.incomplete" type="warning" size="small" effect="plain">{{ t('ps_incomplete') }} {{ row.incomplete }}</el-tag>
+              <el-tag v-if="row.paid === row.nodes" type="success" size="small" effect="plain">{{ t('pc_paid') }}</el-tag>
+            </div>
+          </template></el-table-column>
+        </template>
       </el-table>
       <el-empty v-else-if="!loading" :description="t('payNoneFound')" />
     </div>
@@ -873,7 +934,6 @@ const PaymentsView = {
       <el-pagination background :current-page="page" :page-size="pageSize" :total="total" layout="total, prev, pager, next"
         :pager-count="vw < 640 ? 5 : 7" :size="vw < 640 ? 'small' : 'default'" @current-change="onPage" />
     </div>
-    <PaymentDialog v-model="dlg" :payment="current" :contract-id="current && current.contract_id" :currency="current && current.currency" @saved="load" />
   </div>`,
 };
 

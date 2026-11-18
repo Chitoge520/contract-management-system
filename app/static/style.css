@@ -393,3 +393,16 @@ mark { background: #FFE9A8; }
 .money .cur { color: var(--ink-3); font-size: 12px; }
 .el-table .row-overdue td.el-table__cell, .el-table .row-overdue td.el-table-fixed-column--right { background: #fff6f6; }
 .money .amt + span:empty { display: none; }
+
+/* payment tracking grouped by contract */
+.pay-contracts .money { display: flex; }
+.pay-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.pay-embedded { padding: 4px 8px 8px 8px; }
+.pay-embedded .card-head { margin-bottom: 6px; }
+.pay-contracts .el-table__expanded-cell { background: #FAFBFC; padding: 10px 16px !important; }
+.pay-phone { margin-top: 6px; display: grid; gap: 2px; font-size: 13px; }
+.pay-phone .money { display: inline-flex; }
+@media (max-width: 640px) { .pay-contracts .el-table__expanded-cell { padding: 6px 4px !important; } .pay-embedded { padding: 0; } }
+.pay-phone .muted.small + .money, .pay-phone .muted.small + span { margin-left: 6px; }
+.proof-link.wide a { max-width: 100%; white-space: normal; word-break: break-all; }
+@media (max-width: 760px) { .shell { grid-template-columns: minmax(0, 1fr); } }  /* never wider than the screen */

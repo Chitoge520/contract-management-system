@@ -841,6 +841,54 @@ def delete_payment_file(fid: int, user=Depends(pay_user)):
     return {"ok": True}
 
 
+@app.get("/api/payments/contracts")
+def payment_contracts(status: str = "pending", q: str = "", year: str = "", page: int = 1, page_size: int = 20,
+                      user=Depends(current_user)):
+    """Payment tracking grouped by contract: one row per contract that has payment nodes.
+    status: pending (something left to pay) / overdue / due30 / incomplete / paid (everything paid) / "" (all)."""
+    where, args = _contract_filter(user, year=year)
+    for word in q.split():
+        like = f"%{word.lower()}%"
+        where += (" AND (coalesce(contracts.search_text,'') LIKE ? OR contracts.id IN (SELECT contract_id FROM payments "
+                  "WHERE lower(coalesce(trigger_en,'')||' '||coalesce(trigger_zh,'')||' '||coalesce(note,'')) LIKE ?))")
+        args += [like, like]
+    today = payments.today()
+    ok = payments.paid_sql("p")
+    grouped = (f"SELECT p.contract_id, count(*) nodes, sum({ok}) paid, sum(p.status='paid' AND NOT {ok}) incomplete, "
+               f"sum(NOT {ok} AND p.status<>'paid' AND p.due_date IS NOT NULL AND p.due_date<?) overdue, "
+               f"sum(NOT {ok} AND p.status<>'paid' AND p.due_date>=? AND p.due_date<=date(?, '+30 days')) due30, "
+               f"min(CASE WHEN NOT {ok} THEN p.due_date END) next_due "
+               f"FROM payments p JOIN contracts ON contracts.id=p.contract_id WHERE {where} GROUP BY p.contract_id")
+    gargs = [today, today, today] + args
+    having = {"pending": "paid < nodes", "overdue": "overdue > 0", "due30": "due30 > 0", "incomplete": "incomplete > 0",
+              "paid": "paid = nodes"}.get(status, "1=1")
+    total = db.q(f"SELECT count(*) n FROM ({grouped}) g WHERE {having}", gargs, one=True)["n"]
+    page_size, page = min(max(page_size, 1), 100), max(page, 1)
+    rows = db.q(f"SELECT g.*, c.contract_no, c.title, c.title_zh, c.party_b, c.currency FROM ({grouped}) g "
+                f"JOIN contracts c ON c.id=g.contract_id WHERE {having} "
+                f"ORDER BY g.overdue > 0 DESC, g.next_due IS NULL, g.next_due, g.contract_id DESC LIMIT ? OFFSET ?",
+                gargs + [page_size, (page - 1) * page_size])
+    # planned / paid / unpaid totals per currency, from the nodes of the contracts on this page
+    from decimal import Decimal
+    ids = [r["contract_id"] for r in rows]
+    sums = {i: {} for i in ids}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        for n in db.q(f"SELECT * FROM payments WHERE contract_id IN ({marks})", ids):
+            cur = n["currency"] or ""
+            t = sums[n["contract_id"]].setdefault(cur, {"planned": Decimal(0), "paid": Decimal(0)})
+            if n["amount"] is not None:
+                t["planned"] += Decimal(str(n["amount"]))
+            if payments.is_paid(n):
+                t["paid"] += Decimal(str(n["paid_amount"]))
+    for r in rows:
+        r["paid"] = r["paid"] or 0
+        r["totals"] = [{"currency": cur, "planned": float(t["planned"]), "paid": float(t["paid"]),
+                        "unpaid": float(max(t["planned"] - t["paid"], Decimal(0)))}
+                       for cur, t in sorted(sums[r["contract_id"]].items())]
+    return {"total": total, "page": page, "page_size": page_size, "rows": rows, "today": today}
+
+
 @app.get("/api/payments")
 def payment_tracking(status: str = "", q: str = "", year: str = "", page: int = 1, page_size: int = 20,
                      user=Depends(current_user)):
